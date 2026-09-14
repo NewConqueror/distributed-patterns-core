@@ -17,6 +17,9 @@ type Config struct {
 	DatabaseURL    string
 	DBMaxOpenConns int
 	DBMaxIdleConns int
+	RedisHost      string
+	RedisPort      string
+	RedisPassword  string
 }
 
 func Load() *Config {
@@ -31,7 +34,14 @@ func Load() *Config {
 		DatabaseURL:    os.Getenv("DATABASE_URL"),
 		DBMaxOpenConns: getEnvAsInt("DB_MAX_OPEN_CONNS", 0), // 0 = unlimited by default (shows connection pool exhaustion)
 		DBMaxIdleConns: getEnvAsInt("DB_MAX_IDLE_CONNS", 10),
+		RedisHost:      getEnv("REDIS_HOST", "localhost"),
+		RedisPort:      getEnv("REDIS_PORT", "6379"),
+		RedisPassword:  os.Getenv("REDIS_PASSWORD"),
 	}
+}
+
+func (c *Config) GetRedisAddr() string {
+	return fmt.Sprintf("%s:%s", c.RedisHost, c.RedisPort)
 }
 
 func (c *Config) GetDSN() string {

@@ -29,7 +29,7 @@ db-init: ## Initialize database schema and seed data
 db-reset: ## Reset product stock to 100 and clear orders
 	@curl -s -X POST http://localhost:8080/api/v1/products/1/reset \
 		-H "Content-Type: application/json" \
-		-d '{"stock": 100}' | jq . || echo "Failed to reset stock. Ensure server is running on :8080."
+		-d '{"stock": 100}' && echo ""
 
 test-k6-naive: ## Run k6 load test for naive endpoint (100 VUs, 2000 reqs in 2s)
 	@if command -v k6 >/dev/null 2>&1; then \
@@ -54,6 +54,15 @@ test-k6-optimistic: ## Run k6 load test for optimistic locking endpoint (100 VUs
 		k6 run scripts/k6/optimistic_test.js; \
 	elif [ -f ./k6 ]; then \
 		./k6 run scripts/k6/optimistic_test.js; \
+	else \
+		echo "k6 not found. Please install k6 or run using ./k6"; exit 1; \
+	fi
+
+test-k6-fast: ## Run k6 load test for Redis fast order endpoint (100 VUs, 2000 reqs in 2s)
+	@if command -v k6 >/dev/null 2>&1; then \
+		k6 run scripts/k6/fast_test.js; \
+	elif [ -f ./k6 ]; then \
+		./k6 run scripts/k6/fast_test.js; \
 	else \
 		echo "k6 not found. Please install k6 or run using ./k6"; exit 1; \
 	fi

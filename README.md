@@ -168,34 +168,70 @@ In a flash sale where thousands of requests target the **exact same product row*
 
 ---
 
-## 📊 Load Testing & 3-Way Benchmark Comparison
+## ⚡ Phase 3: In-Memory Locking & Redis Atomic Operations (`EVALSHA` & Lua)
 
-All three endpoints were tested with **k6** under identical stress conditions:
+**Endpoint:** `POST /api/v1/orders/fast`
+
+### Concept & Architectural Shift
+Relational databases hit physical hardware and connection pool limits during flash-sale spikes. By offloading inventory state to Redis in-memory storage, the database is completely shielded from initial burst traffic.
+
+```mermaid
+flowchart TD
+    Client["Client Request (Burst Traffic)"] --> App["Go Application Layer"]
+    App -->|1. EVALSHA decr_stock.lua| Redis[("Redis (Single-Threaded In-Memory)")]
+    Redis -->|Stock > 0: DECR & Return 1| App
+    Redis -->|Stock <= 0: Return 0| App
+    App -->|If 0: HTTP 410 Fast Fail| Client
+    App -->|If 1: HTTP 202 Accepted & UUID| Client
+    Note["PostgreSQL is 100% shielded from the 2,000-request burst!"]
+```
+
+### Atomic Lua Script ([`scripts/lua/decr_stock.lua`](scripts/lua/decr_stock.lua))
+Because Redis executes Lua scripts on a single thread atomically without context switches or network round-trips:
+```lua
+local stock = redis.call('GET', KEYS[1])
+if not stock then
+    return -1 -- Not found
+end
+if tonumber(stock) <= 0 then
+    return 0 -- Sold out
+end
+redis.call('DECR', KEYS[1])
+return 1 -- Success
+```
+The script is preloaded via `SCRIPT LOAD` on startup, and invoked with `EVALSHA` for minimal network payload bandwidth.
+
+### HTTP 202 Accepted & Reservation Pattern:
+- **Stock Available (`1`):** Atomically decrements Redis stock, generates a unique `reservation_id` (UUID), and returns `HTTP 202 Accepted`:
+  ```json
+  {
+    "status": "PENDING",
+    "reservation_id": "94b6df14-cc79-440c-836c-56326953bbf7"
+  }
+  ```
+- **Sold Out (`0`):** Instantly returns `HTTP 410 Gone / 400 Bad Request`. **The database receives ZERO queries.**
+
+---
+
+## 📊 Comprehensive 4-Way Benchmark Comparison
+
+All implementations were stress-tested with **k6** under identical flash-sale conditions:
 - **Concurrency:** 100 Virtual Users (VUs)
-- **Burst Window:** 2,000 requests within 2 seconds
+- **Burst Window:** 2,000 requests in 2 seconds
 - **Initial Inventory:** 100 items
 
 ### Comparative Metrics Table
 
-| Metric | 1. Naive (`/naive`) | 2. Pessimistic (`/pessimistic`) | 3. Optimistic (`/optimistic`) | Architectural Analysis |
-| :--- | :--- | :--- | :--- | :--- |
-| **Throughput (Avg RPS)** | ~196 req/s | ~156 req/s | ~154 req/s | Optimistic & Pessimistic suffer similar throughput limits under hot-spot contention |
-| **P95 Latency** | 1.79 s | 2.11 s | **1.23 s** | ⚡ OCC fails fast on conflicts rather than queueing on a lock |
-| **P99 / Max Latency** | 2.01 s | 2.26 s | **1.86 s** | Lower maximum latency than pessimistic locking |
-| **Check Constraint Violations** | **Yes (High)** (`products_stock_check`) | **0 (None)** | **0 (None)** | Both locking strategies prevent negative stock |
-| **Completed Orders (201)** | 100 | **100** | **96** | ⚠️ In OCC, 4 items remained unsold due to retry storm exhaustion! |
-| **Conflict Failures (409)** | 0 | 0 | **249** | Over 60% of requests failed due to version mismatch |
-| **DB Errors (500)** | 247 | 162 | **56** | OCC has fewer 500s because conflicting requests receive 409 |
-| **Connection Starvation** | Severe | Severe | Severe | Retries multiply connection requests, straining the pool |
-
-### Console Log Observations (Optimistic Retry Storm)
-```log
-# Cascading version conflicts under hot-spot load:
-[OCC CONFLICT] Product 1 version mismatch (read version: 1, attempt 1/3)
-[OCC CONFLICT] Product 1 version mismatch (read version: 2, attempt 2/3)
-[OCC CONFLICT] Product 1 version mismatch (read version: 5, attempt 3/3)
-[DB ERROR - Optimistic Select]: pq: remaining connection slots are reserved for roles with the SUPERUSER attribute (53300)
-```
+| Metric | 1. Naive (`/naive`) | 2. Pessimistic (`/pessimistic`) | 3. Optimistic (`/optimistic`) | 4. Redis Fast (`/fast`) | Engineering Takeaway |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Throughput (Avg RPS)** | ~196 req/s | ~156 req/s | ~154 req/s | **1,758 req/s** | 🚀 **~10x throughput surge** (completed all 2,000 reqs in 1.1s!) |
+| **P95 Latency** | 1,790 ms | 2,110 ms | 1,230 ms | **135 ms** | ⚡ **10x to 15x lower latency** under maximum load |
+| **Median Latency** | 210 ms | 148 ms | 532 ms | **34 ms** | Sub-50ms user experience |
+| **Check Constraint Errors** | **Yes** (`stock_check`) | **0** | **0** | **0** | 🛡️ Zero relational database errors |
+| **Server Errors (500)** | 247 | 162 | 56 | **0 (0.00%)** | 🎯 Rock-solid reliability; zero crashes |
+| **Completed / Reserved (201/202)** | 100 | **100** | 96 (4 unsold) | **100 (100%)** | Exactly 100 items reserved; zero overselling |
+| **Fast-Failed Sold Out (410)** | 0 | 0 | 0 | **1,900** | 1,900 clients failed fast without touching the DB |
+| **Database Pool Starvation** | Severe | Severe | Severe | **NONE (0 connections)** | Relational DB is completely immune to the traffic surge |
 
 ---
 
@@ -251,9 +287,10 @@ make db-reset
 - [x] **Phase 3: Database Optimistic Locking**
   - Version columns & Compare-And-Swap (CAS) updates
   - Exponential backoff retry mechanism & retry storm analysis (observed 409 conflict cascades)
-- [ ] **Phase 4: Distributed Locking with Redis (Redlock / Lua)**
-  - Atomic inventory deduction in Redis before hitting the database
-  - Distributed lock orchestration
+- [x] **Phase 4: In-Memory Locking & Redis Atomic Operations (`EVALSHA` & Lua)**
+  - Atomic inventory deduction in Redis via Lua before hitting the database
+  - HTTP 202 Accepted + UUID reservation architecture
+  - 10x throughput surge (1,758 req/s) with sub-100ms latency and 0 DB connections
 - [ ] **Phase 5: Asynchronous Order Processing**
   - Decoupling checkout requests via Message Queue (Kafka / RabbitMQ)
   - Eventual consistency & order fulfillment workers

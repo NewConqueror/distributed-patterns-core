@@ -5,15 +5,17 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"flashsale/internal/database"
 	"flashsale/internal/model"
 )
 
 type Handler struct {
-	db *sql.DB
+	db    *sql.DB
+	redis *database.RedisService
 }
 
-func NewHandler(db *sql.DB) *Handler {
-	return &Handler{db: db}
+func NewHandler(db *sql.DB, redisSvc *database.RedisService) *Handler {
+	return &Handler{db: db, redis: redisSvc}
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
@@ -21,6 +23,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/orders/naive", h.CreateOrderNaive)
 	mux.HandleFunc("POST /api/v1/orders/pessimistic", h.CreateOrderPessimistic)
 	mux.HandleFunc("POST /api/v1/orders/optimistic", h.CreateOrderOptimistic)
+	mux.HandleFunc("POST /api/v1/orders/fast", h.CreateOrderFast)
 
 	// Products
 	mux.HandleFunc("GET /api/v1/products/{id}", h.GetProduct)
@@ -34,6 +37,12 @@ func (h *Handler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	if err := h.db.PingContext(r.Context()); err != nil {
 		writeError(w, http.StatusServiceUnavailable, "Database unreachable")
 		return
+	}
+	if h.redis != nil {
+		if err := h.redis.Client.Ping(r.Context()).Err(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, "Redis unreachable")
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

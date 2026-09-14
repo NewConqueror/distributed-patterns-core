@@ -37,3 +37,4 @@ go.work
 # Temporary / scratch files
 scratch/
 tmp/
+dump.rdb

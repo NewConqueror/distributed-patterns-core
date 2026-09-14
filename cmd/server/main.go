@@ -23,8 +23,14 @@ func main() {
 	}
 	defer db.Close()
 
+	redisSvc, err := database.NewRedisService(cfg)
+	if err != nil {
+		log.Fatalf("[FATAL] Redis initialization failed: %v\n", err)
+	}
+	defer redisSvc.Client.Close()
+
 	mux := http.NewServeMux()
-	h := handler.NewHandler(db)
+	h := handler.NewHandler(db, redisSvc)
 	h.RegisterRoutes(mux)
 
 	server := &http.Server{

@@ -24,3 +24,8 @@ type Order struct {
 type ErrorResponse struct {
 	Error string `json:"error"`
 }
+
+type FastOrderResponse struct {
+	Status        string `json:"status"`
+	ReservationID string `json:"reservation_id"`
+}
