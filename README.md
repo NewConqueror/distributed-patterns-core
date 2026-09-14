@@ -141,29 +141,60 @@ COMMIT; -- Releases row lock
 
 ---
 
-## 📊 Load Testing & Benchmark Comparison
+## 🔄 Phase 2.2: Optimistic Concurrency Control (Versioning / CAS)
 
-Both endpoints were tested with **k6** under identical stress conditions:
+**Endpoint:** `POST /api/v1/orders/optimistic`
+
+### Concept & SQL Flow
+Instead of locking rows, rows are tagged with a `version INT DEFAULT 0` column. Updates use Compare-And-Swap (CAS):
+```sql
+-- 1. Lock-free read
+SELECT stock, version FROM products WHERE id = :id;
+
+-- 2. Atomic Compare-And-Swap (CAS)
+UPDATE products 
+SET stock = stock - 1, version = version + 1 
+WHERE id = :id AND version = :current_version;
+
+-- 3. If RowsAffected == 0: conflict detected! Apply exponential backoff and retry (up to 3 times).
+```
+
+### The "Retry Storm" Phenomenon (High Contention Failure):
+In a flash sale where thousands of requests target the **exact same product row**:
+- Only **1 request succeeds** per version increment.
+- All other concurrent requests fail their CAS check and enter the retry loop simultaneously.
+- This creates a **Retry Storm**: DB query count multiplies by 3x (~1,000 queries in 2 seconds), connection pools are starved, and 249 clients receive `409 Conflict` because max retries are exhausted.
+- **Critical Finding:** Even though 100 items were in stock and 2,000 customers attempted to purchase, **4 items remained unsold** due to retry exhaustion!
+
+---
+
+## 📊 Load Testing & 3-Way Benchmark Comparison
+
+All three endpoints were tested with **k6** under identical stress conditions:
 - **Concurrency:** 100 Virtual Users (VUs)
 - **Burst Window:** 2,000 requests within 2 seconds
 - **Initial Inventory:** 100 items
 
-### Comparative Metrics
+### Comparative Metrics Table
 
-| Metric | Naive Endpoint (`/naive`) | Pessimistic Lock (`/pessimistic`) | Impact / Takeaway |
-| :--- | :--- | :--- | :--- |
-| **Throughput (Avg RPS)** | ~196 req/s | ~156 req/s | 🔻 ~20% throughput drop due to lock serialization |
-| **P95 Latency** | 1.79 s | **2.11 s** | 🔺 Increased queue wait time for row lock |
-| **P99 / Max Latency** | 2.01 s | **2.26 s** | 🔺 Requests hit maximum client timeouts |
-| **Check Constraint Violations** | **Yes (High)** (`products_stock_check`) | **0 (None)** | 🛡️ Pessimistic lock completely eliminates data inconsistency |
-| **Connection Pool Exhaustion** | Yes (`too many clients already`) | **Yes (Severe)** | ⚠️ Connections held idle while waiting in line for the lock |
-| **Final Data Integrity** | Stock: 0 / Orders: 100 | Stock: 0 / Orders: 100 | Both reached 100, but Naive crashed 247 requests with 500 errors |
+| Metric | 1. Naive (`/naive`) | 2. Pessimistic (`/pessimistic`) | 3. Optimistic (`/optimistic`) | Architectural Analysis |
+| :--- | :--- | :--- | :--- | :--- |
+| **Throughput (Avg RPS)** | ~196 req/s | ~156 req/s | ~154 req/s | Optimistic & Pessimistic suffer similar throughput limits under hot-spot contention |
+| **P95 Latency** | 1.79 s | 2.11 s | **1.23 s** | ⚡ OCC fails fast on conflicts rather than queueing on a lock |
+| **P99 / Max Latency** | 2.01 s | 2.26 s | **1.86 s** | Lower maximum latency than pessimistic locking |
+| **Check Constraint Violations** | **Yes (High)** (`products_stock_check`) | **0 (None)** | **0 (None)** | Both locking strategies prevent negative stock |
+| **Completed Orders (201)** | 100 | **100** | **96** | ⚠️ In OCC, 4 items remained unsold due to retry storm exhaustion! |
+| **Conflict Failures (409)** | 0 | 0 | **249** | Over 60% of requests failed due to version mismatch |
+| **DB Errors (500)** | 247 | 162 | **56** | OCC has fewer 500s because conflicting requests receive 409 |
+| **Connection Starvation** | Severe | Severe | Severe | Retries multiply connection requests, straining the pool |
 
-### Console Log Observations (Pessimistic)
+### Console Log Observations (Optimistic Retry Storm)
 ```log
-# No check constraint violations! But connection pool starvation persists:
-[DB ERROR - BeginTx (Pessimistic)]: pq: sorry, too many clients already (53300)
-[DB ERROR - BeginTx (Pessimistic)]: pq: remaining connection slots are reserved for roles with the SUPERUSER attribute (53300)
+# Cascading version conflicts under hot-spot load:
+[OCC CONFLICT] Product 1 version mismatch (read version: 1, attempt 1/3)
+[OCC CONFLICT] Product 1 version mismatch (read version: 2, attempt 2/3)
+[OCC CONFLICT] Product 1 version mismatch (read version: 5, attempt 3/3)
+[DB ERROR - Optimistic Select]: pq: remaining connection slots are reserved for roles with the SUPERUSER attribute (53300)
 ```
 
 ---
@@ -217,9 +248,9 @@ make db-reset
 - [x] **Phase 2: Database Pessimistic Locking**
   - Implement `SELECT ... FOR UPDATE` row-level locks
   - Analyze throughput impact vs consistency guarantees (zero overselling, but high P99 & pool contention)
-- [ ] **Phase 3: Database Optimistic Locking**
+- [x] **Phase 3: Database Optimistic Locking**
   - Version columns & Compare-And-Swap (CAS) updates
-  - Retry mechanisms & backoff strategies
+  - Exponential backoff retry mechanism & retry storm analysis (observed 409 conflict cascades)
 - [ ] **Phase 4: Distributed Locking with Redis (Redlock / Lua)**
   - Atomic inventory deduction in Redis before hitting the database
   - Distributed lock orchestration

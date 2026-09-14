@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"time"
 
 	"flashsale/internal/model"
 )
@@ -184,4 +185,130 @@ func (h *Handler) CreateOrderPessimistic(w http.ResponseWriter, r *http.Request)
 		UserID:    req.UserID,
 		Message:   "Order created successfully (Pessimistic Lock)",
 	})
+}
+
+// CreateOrderOptimistic handles order creation using Optimistic Concurrency Control (OCC) with versioning.
+//
+// MECHANISM:
+// - Reads current stock and version without acquiring a database lock.
+// - Attempts atomic update: UPDATE products SET stock = stock - 1, version = version + 1 WHERE id = :id AND version = :current_version
+// - Checks RowsAffected():
+//   - If 1: update succeeded, inserts order, commits.
+//   - If 0: conflict detected (another transaction modified the version).
+// - Retries up to 3 times with exponential backoff.
+//
+// HIGH CONTENTION BEHAVIOR (The "Retry Storm"):
+// In flash sale scenarios where hundreds of concurrent requests target the EXACT same item:
+// - Only 1 request succeeds per version bump.
+// - All other concurrent requests fail their CAS update and enter the retry loop simultaneously.
+// - This triggers a "Retry Storm", multiplying DB queries, burning CPU, and exhausting connection pools,
+//   causing widespread 409 Conflict failures.
+func (h *Handler) CreateOrderOptimistic(w http.ResponseWriter, r *http.Request) {
+	var req model.OrderRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request payload")
+		return
+	}
+
+	if req.ProductID <= 0 || req.UserID == "" {
+		writeError(w, http.StatusBadRequest, "product_id and user_id are required")
+		return
+	}
+
+	const maxRetries = 3
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// 1. SELECT stock, version FROM products WHERE id = :id (Lock-free read)
+		var stock, currentVersion int
+		err := h.db.QueryRowContext(r.Context(),
+			"SELECT stock, version FROM products WHERE id = $1", req.ProductID).
+			Scan(&stock, &currentVersion)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeError(w, http.StatusNotFound, "Product not found")
+				return
+			}
+			log.Printf("[DB ERROR - Optimistic Select]: %v\n", err)
+			writeError(w, http.StatusInternalServerError, "Failed to read product: "+err.Error())
+			return
+		}
+
+		// 2. Stok kontrolü: Stok 0 veya altındaysa tekrar denemenin anlamı yok
+		if stock <= 0 {
+			writeError(w, http.StatusBadRequest, "Out of stock")
+			return
+		}
+
+		// 3. CAS Update (Compare-And-Swap) in transaction
+		tx, err := h.db.BeginTx(r.Context(), nil)
+		if err != nil {
+			log.Printf("[DB ERROR - Optimistic BeginTx]: %v\n", err)
+			writeError(w, http.StatusInternalServerError, "Failed to begin transaction: "+err.Error())
+			return
+		}
+
+		res, err := tx.ExecContext(r.Context(),
+			"UPDATE products SET stock = stock - 1, version = version + 1 WHERE id = $1 AND version = $2",
+			req.ProductID, currentVersion)
+		if err != nil {
+			_ = tx.Rollback()
+			log.Printf("[DB ERROR - Optimistic Update]: %v\n", err)
+			writeError(w, http.StatusInternalServerError, "Failed to update stock: "+err.Error())
+			return
+		}
+
+		rowsAffected, err := res.RowsAffected()
+		if err != nil {
+			_ = tx.Rollback()
+			writeError(w, http.StatusInternalServerError, "Failed to check affected rows: "+err.Error())
+			return
+		}
+
+		// 4. Eğer satır etkilenmediyse (rowsAffected == 0), başka biri araya girmiştir -> Çakışma (Conflict)
+		if rowsAffected == 0 {
+			_ = tx.Rollback()
+			log.Printf("[OCC CONFLICT] Product %d version mismatch (read version: %d, attempt %d/%d)\n",
+				req.ProductID, currentVersion, attempt+1, maxRetries)
+
+			if attempt < maxRetries-1 {
+				// Exponential backoff: 10ms, 20ms
+				backoff := time.Duration(10*(1<<attempt)) * time.Millisecond
+				time.Sleep(backoff)
+				continue
+			}
+
+			// Maksimum deneme aşıldı
+			writeError(w, http.StatusConflict, "Optimistic lock conflict: retry limit exceeded")
+			return
+		}
+
+		// 5. Başarılı ise sipariş kaydını oluştur
+		var orderID int
+		err = tx.QueryRowContext(
+			r.Context(),
+			"INSERT INTO orders (product_id, user_id) VALUES ($1, $2) RETURNING id",
+			req.ProductID,
+			req.UserID,
+		).Scan(&orderID)
+		if err != nil {
+			_ = tx.Rollback()
+			log.Printf("[DB ERROR - Optimistic Insert Order]: %v\n", err)
+			writeError(w, http.StatusInternalServerError, "Failed to record order: "+err.Error())
+			return
+		}
+
+		if err := tx.Commit(); err != nil {
+			log.Printf("[DB ERROR - Optimistic Commit]: %v\n", err)
+			writeError(w, http.StatusInternalServerError, "Failed to commit order: "+err.Error())
+			return
+		}
+
+		writeJSON(w, http.StatusCreated, model.OrderResponse{
+			OrderID:   orderID,
+			ProductID: req.ProductID,
+			UserID:    req.UserID,
+			Message:   "Order created successfully (Optimistic Lock)",
+		})
+		return
+	}
 }

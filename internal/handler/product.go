@@ -21,8 +21,8 @@ func (h *Handler) GetProduct(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var product model.Product
-	err = h.db.QueryRowContext(r.Context(), "SELECT id, name, stock FROM products WHERE id = $1", id).
-		Scan(&product.ID, &product.Name, &product.Stock)
+	err = h.db.QueryRowContext(r.Context(), "SELECT id, name, stock, version FROM products WHERE id = $1", id).
+		Scan(&product.ID, &product.Name, &product.Stock, &product.Version)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "Product not found")
@@ -35,7 +35,7 @@ func (h *Handler) GetProduct(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, product)
 }
 
-// ResetProductStock resets product stock and truncates/deletes orders for reproducible load testing.
+// ResetProductStock resets product stock, version to 0, and truncates/deletes orders for reproducible load testing.
 func (h *Handler) ResetProductStock(w http.ResponseWriter, r *http.Request) {
 	idStr := r.PathValue("id")
 	id, err := strconv.Atoi(idStr)
@@ -59,7 +59,7 @@ func (h *Handler) ResetProductStock(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	_, err = tx.ExecContext(r.Context(), "UPDATE products SET stock = $1 WHERE id = $2", targetStock, id)
+	_, err = tx.ExecContext(r.Context(), "UPDATE products SET stock = $1, version = 0 WHERE id = $2", targetStock, id)
 	if err != nil {
 		log.Printf("[DB ERROR - Reset Stock]: %v\n", err)
 		writeError(w, http.StatusInternalServerError, "Failed to reset stock: "+err.Error())
