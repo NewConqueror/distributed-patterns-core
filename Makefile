@@ -40,5 +40,14 @@ test-k6-naive: ## Run k6 load test for naive endpoint (100 VUs, 2000 reqs in 2s)
 		echo "k6 not found. Please install k6 or run using ./k6"; exit 1; \
 	fi
 
+test-k6-pessimistic: ## Run k6 load test for pessimistic locking endpoint (100 VUs, 2000 reqs in 2s)
+	@if command -v k6 >/dev/null 2>&1; then \
+		k6 run scripts/k6/pessimistic_test.js; \
+	elif [ -f ./k6 ]; then \
+		./k6 run scripts/k6/pessimistic_test.js; \
+	else \
+		echo "k6 not found. Please install k6 or run using ./k6"; exit 1; \
+	fi
+
 clean: ## Clean built binaries and temporary files
 	rm -rf $(BIN_DIR)

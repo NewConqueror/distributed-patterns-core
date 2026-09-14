@@ -19,6 +19,7 @@ func NewHandler(db *sql.DB) *Handler {
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	// Orders
 	mux.HandleFunc("POST /api/v1/orders/naive", h.CreateOrderNaive)
+	mux.HandleFunc("POST /api/v1/orders/pessimistic", h.CreateOrderPessimistic)
 
 	// Products
 	mux.HandleFunc("GET /api/v1/products/{id}", h.GetProduct)

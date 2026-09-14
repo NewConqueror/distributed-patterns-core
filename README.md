@@ -120,33 +120,50 @@ Content-Type: application/json
 
 ---
 
-## 📊 Load Testing & Breakpoint Analysis
+## 🔒 Phase 2.1: Pessimistic Concurrency Control (`SELECT ... FOR UPDATE`)
 
-Load test executed with **k6** simulating a flash-sale spike:
+**Endpoint:** `POST /api/v1/orders/pessimistic`
+
+### Concept & SQL Flow
+To eliminate race conditions at the database level, an exclusive row lock is acquired before checking stock:
+```sql
+BEGIN;
+SELECT stock FROM products WHERE id = :id FOR UPDATE; -- Acquires exclusive row lock
+-- Application verifies: if stock > 0
+UPDATE products SET stock = stock - 1 WHERE id = :id;
+INSERT INTO orders (product_id, user_id) VALUES (:id, :user_id);
+COMMIT; -- Releases row lock
+```
+
+### Engineering Trade-Off:
+- **Pros:** 100% Data Consistency. Exactly 0 overselling, 0 negative stock, and 0 check constraint violations.
+- **Cons:** Requests queue up sequentially for the same row lock. P95/P99 latencies soar, and connection pool starvation (`sorry, too many clients already`) worsens as waiting connections hold open slots.
+
+---
+
+## 📊 Load Testing & Benchmark Comparison
+
+Both endpoints were tested with **k6** under identical stress conditions:
 - **Concurrency:** 100 Virtual Users (VUs)
-- **Target:** 2,000 requests within a 2-second burst window
-- **Initial Stock:** 100 items
+- **Burst Window:** 2,000 requests within 2 seconds
+- **Initial Inventory:** 100 items
 
-### Benchmark Results
+### Comparative Metrics
 
-| Metric | Result | Description |
-| :--- | :--- | :--- |
-| **Throughput (Avg RPS)** | **~196 req/s** | Target 2,000 reqs throttled by lock contention and pool limits |
-| **P95 Latency** | **1.79 s** | High latency due to connection queueing and row-level serialization |
-| **P99 Latency** | **2.01 s** | Requests reaching duration timeouts |
-| **Failure Rate (% Fail)** | **76.90%** | 333 out of 433 completed requests failed |
-| **Completed Orders (201)** | **100** | Inventory limit reached |
-| **Server / DB Crashes (500)** | **247** | Unhandled check constraints & pool starvation |
+| Metric | Naive Endpoint (`/naive`) | Pessimistic Lock (`/pessimistic`) | Impact / Takeaway |
+| :--- | :--- | :--- | :--- |
+| **Throughput (Avg RPS)** | ~196 req/s | ~156 req/s | 🔻 ~20% throughput drop due to lock serialization |
+| **P95 Latency** | 1.79 s | **2.11 s** | 🔺 Increased queue wait time for row lock |
+| **P99 / Max Latency** | 2.01 s | **2.26 s** | 🔺 Requests hit maximum client timeouts |
+| **Check Constraint Violations** | **Yes (High)** (`products_stock_check`) | **0 (None)** | 🛡️ Pessimistic lock completely eliminates data inconsistency |
+| **Connection Pool Exhaustion** | Yes (`too many clients already`) | **Yes (Severe)** | ⚠️ Connections held idle while waiting in line for the lock |
+| **Final Data Integrity** | Stock: 0 / Orders: 100 | Stock: 0 / Orders: 100 | Both reached 100, but Naive crashed 247 requests with 500 errors |
 
-### Console Log Evidence
-
+### Console Log Observations (Pessimistic)
 ```log
-# 1. Connection Pool Exhaustion:
-[DB ERROR - BeginTx]: pq: sorry, too many clients already (53300)
-[DB ERROR - BeginTx]: pq: remaining connection slots are reserved for roles with the SUPERUSER attribute (53300)
-
-# 2. Race Condition - Check Constraint Violation:
-[DB ERROR - Update Stock]: pq: new row for relation "products" violates check constraint "products_stock_check" (23514)
+# No check constraint violations! But connection pool starvation persists:
+[DB ERROR - BeginTx (Pessimistic)]: pq: sorry, too many clients already (53300)
+[DB ERROR - BeginTx (Pessimistic)]: pq: remaining connection slots are reserved for roles with the SUPERUSER attribute (53300)
 ```
 
 ---
@@ -197,9 +214,9 @@ make db-reset
   - Initial Go HTTP service & PostgreSQL schema
   - Baseline k6 load testing & metric extraction
   - Observed connection pool starvation & DB check constraint violations
-- [ ] **Phase 2: Database Pessimistic Locking**
+- [x] **Phase 2: Database Pessimistic Locking**
   - Implement `SELECT ... FOR UPDATE` row-level locks
-  - Analyze throughput impact vs consistency guarantees
+  - Analyze throughput impact vs consistency guarantees (zero overselling, but high P99 & pool contention)
 - [ ] **Phase 3: Database Optimistic Locking**
   - Version columns & Compare-And-Swap (CAS) updates
   - Retry mechanisms & backoff strategies
