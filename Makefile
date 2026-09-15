@@ -67,5 +67,12 @@ test-k6-fast: ## Run k6 load test for Redis fast order endpoint (100 VUs, 2000 r
 		echo "k6 not found. Please install k6 or run using ./k6"; exit 1; \
 	fi
 
+test-ttl: ## Run automated TTL expiration and inventory rollback test
+	python3 scripts/tests/test_ttl_rollback.py
+
+test-idempotency: ## Run automated At-Least-Once delivery and idempotency defense test
+	python3 scripts/tests/test_idempotency.py
+
 clean: ## Clean built binaries and temporary files
 	rm -rf $(BIN_DIR)
+

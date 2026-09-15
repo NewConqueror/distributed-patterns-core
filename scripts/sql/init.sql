@@ -9,10 +9,14 @@ CREATE TABLE IF NOT EXISTS products (
 -- Orders Table
 CREATE TABLE IF NOT EXISTS orders (
     id SERIAL PRIMARY KEY,
+    reservation_id VARCHAR(64) UNIQUE,
     product_id INT REFERENCES products(id),
     user_id VARCHAR(64) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'COMPLETED',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_reservation_id ON orders(reservation_id);
 
 -- Transactional Outbox Table
 CREATE TABLE IF NOT EXISTS outbox_events (

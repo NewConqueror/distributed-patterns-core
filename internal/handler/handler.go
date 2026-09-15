@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"flashsale/internal/database"
+	"flashsale/internal/metrics"
 	"flashsale/internal/model"
 )
 
@@ -24,13 +25,16 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/orders/pessimistic", h.CreateOrderPessimistic)
 	mux.HandleFunc("POST /api/v1/orders/optimistic", h.CreateOrderOptimistic)
 	mux.HandleFunc("POST /api/v1/orders/fast", h.CreateOrderFast)
+	mux.HandleFunc("POST /api/v1/orders/pay", h.PayOrder)
+	mux.HandleFunc("GET /api/v1/orders/{id}", h.GetOrder)
 
 	// Products
 	mux.HandleFunc("GET /api/v1/products/{id}", h.GetProduct)
 	mux.HandleFunc("POST /api/v1/products/{id}/reset", h.ResetProductStock)
 
-	// Health Check
+	// Health Check & Metrics
 	mux.HandleFunc("GET /healthz", h.HealthCheck)
+	mux.Handle("GET /metrics", metrics.Handler())
 }
 
 func (h *Handler) HealthCheck(w http.ResponseWriter, r *http.Request) {

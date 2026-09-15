@@ -33,6 +33,12 @@ redis.call('XADD', KEYS[2], '*',
     'created_at', ARGV[4]
 )
 
+-- 3. Rezervasyon TTL anahtarı oluştur (Zaman aşımı / Rollback için: order:{reservation_id}:ttl -> product_id)
+local ttl = tonumber(ARGV[5])
+if ttl and ttl > 0 then
+    redis.call('SET', 'order:' .. ARGV[1] .. ':ttl', ARGV[2], 'EX', ttl)
+end
+
 return 1 -- Başarılı
 `
 
@@ -111,22 +117,27 @@ func (s *RedisService) GetProductStock(ctx context.Context, productID int) (int,
 }
 
 // DecrStockAndEnqueue executes the atomic Lua script via EVALSHA.
-// It decrements stock AND pushes the reservation to Redis Stream in the exact same atomic transaction,
-// guaranteeing zero dual-write discrepancy.
+// It decrements stock, pushes the reservation to Redis Stream, AND sets the order TTL key
+// in the exact same atomic transaction, guaranteeing zero dual-write discrepancy.
 //
 // Returns:
 //
-//	 1: Stock successfully decremented and event enqueued
+//	 1: Stock successfully decremented, event enqueued, TTL key created
 //	 0: Out of stock (stock <= 0)
 //	-1: Product key not found in Redis
-func (s *RedisService) DecrStockAndEnqueue(ctx context.Context, productID int, reservationID, userID string) (int64, error) {
+func (s *RedisService) DecrStockAndEnqueue(ctx context.Context, productID int, reservationID, userID string, ttlSeconds int) (int64, error) {
+	if ttlSeconds <= 0 {
+		ttlSeconds = 600 // Default 10 minutes (600s)
+	}
+
 	productKey := ProductStockKey(productID)
 	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+	ttlStr := strconv.Itoa(ttlSeconds)
 
-	res, err := s.Client.EvalSha(ctx, s.decrStockSHA, []string{productKey, OrderStreamKey}, reservationID, strconv.Itoa(productID), userID, nowStr).Result()
+	res, err := s.Client.EvalSha(ctx, s.decrStockSHA, []string{productKey, OrderStreamKey}, reservationID, strconv.Itoa(productID), userID, nowStr, ttlStr).Result()
 	if err != nil {
 		if redis.HasErrorPrefix(err, "NOSCRIPT") {
-			res, err = s.Client.Eval(ctx, defaultDecrStockLua, []string{productKey, OrderStreamKey}, reservationID, strconv.Itoa(productID), userID, nowStr).Result()
+			res, err = s.Client.Eval(ctx, defaultDecrStockLua, []string{productKey, OrderStreamKey}, reservationID, strconv.Itoa(productID), userID, nowStr, ttlStr).Result()
 			if err != nil {
 				return 0, err
 			}
@@ -201,3 +212,50 @@ func (s *RedisService) ReadStreamBatch(ctx context.Context, lastID string, count
 func (s *RedisService) ClearStream(ctx context.Context) error {
 	return s.Client.Del(ctx, OrderStreamKey).Err()
 }
+
+// -----------------------------------------------------------------------------
+// Phase 5: Idempotency & TTL / Rollback Methods
+// -----------------------------------------------------------------------------
+
+// TryAcquireIdempotencyLock attempts to set idempotency:{reservation_id} "PROCESSING" NX EX 60s.
+// Returns true if the lock was acquired (first time processing this reservation).
+// Returns false if the key already exists (duplicate delivery detected - at-least-once defense).
+func (s *RedisService) TryAcquireIdempotencyLock(ctx context.Context, reservationID string, ttl time.Duration) (bool, error) {
+	key := fmt.Sprintf("idempotency:%s", reservationID)
+	return s.Client.SetNX(ctx, key, "PROCESSING", ttl).Result()
+}
+
+// MarkIdempotencyCompleted updates the idempotency key to "COMPLETED" while preserving TTL.
+func (s *RedisService) MarkIdempotencyCompleted(ctx context.Context, reservationID string) error {
+	key := fmt.Sprintf("idempotency:%s", reservationID)
+	return s.Client.SetXX(ctx, key, "COMPLETED", redis.KeepTTL).Err()
+}
+
+// OrderTTLKey returns the Redis key for reservation TTL expiration tracking.
+func OrderTTLKey(reservationID string) string {
+	return fmt.Sprintf("order:%s:ttl", reservationID)
+}
+
+// GetReservationTTL returns the remaining TTL for a reservation.
+func (s *RedisService) GetReservationTTL(ctx context.Context, reservationID string) (time.Duration, error) {
+	key := OrderTTLKey(reservationID)
+	return s.Client.TTL(ctx, key).Result()
+}
+
+// DeleteReservationTTL deletes the TTL key when payment is confirmed, preventing rollback.
+func (s *RedisService) DeleteReservationTTL(ctx context.Context, reservationID string) error {
+	key := OrderTTLKey(reservationID)
+	return s.Client.Del(ctx, key).Err()
+}
+
+// IncrProductStock atomically increments product stock in Redis via INCR (used on rollback/timeout).
+func (s *RedisService) IncrProductStock(ctx context.Context, productID int) (int64, error) {
+	key := ProductStockKey(productID)
+	return s.Client.Incr(ctx, key).Result()
+}
+
+// SubscribeKeyExpiration subscribes to Redis keyspace notifications for key expiration events (__keyevent@0__:expired).
+func (s *RedisService) SubscribeKeyExpiration(ctx context.Context) *redis.PubSub {
+	return s.Client.Subscribe(ctx, "__keyevent@0__:expired")
+}
+

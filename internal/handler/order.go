@@ -6,11 +6,16 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strconv"
+	"sync"
 	"time"
 
+	"flashsale/internal/metrics"
 	"flashsale/internal/model"
 	"github.com/google/uuid"
 )
+
+var saleStartTimes sync.Map
 
 // CreateOrderNaive handles order creation using the Naive (Flawed) approach.
 //
@@ -327,6 +332,7 @@ func (h *Handler) CreateOrderOptimistic(w http.ResponseWriter, r *http.Request) 
 // - Sub-10ms P99 latency.
 // - Zero DB connections consumed during traffic spike.
 // - Zero overselling guaranteed by Redis single-threaded execution model.
+// - Atomically establishes order:{reservation_id}:ttl key in Redis for automatic rollback if unpaid.
 func (h *Handler) CreateOrderFast(w http.ResponseWriter, r *http.Request) {
 	var req model.OrderRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -347,9 +353,17 @@ func (h *Handler) CreateOrderFast(w http.ResponseWriter, r *http.Request) {
 	// 1. Generate unique reservation_id (UUID)
 	reservationID := uuid.New().String()
 
+	// Optional custom TTL in seconds via query param ?ttl=10 (defaults to 600s / 10m)
+	ttlSeconds := 600
+	if ttlQuery := r.URL.Query().Get("ttl"); ttlQuery != "" {
+		if t, err := strconv.Atoi(ttlQuery); err == nil && t > 0 {
+			ttlSeconds = t
+		}
+	}
+
 	// 2. Execute preloaded atomic Lua script on Redis via EVALSHA
-	// Decrements stock AND appends to Redis Stream in ONE atomic step (Zero Dual-Write Hazard!)
-	res, err := h.redis.DecrStockAndEnqueue(r.Context(), req.ProductID, reservationID, req.UserID)
+	// Decrements stock, appends to Redis Stream, AND sets order TTL key in ONE atomic step (Zero Dual-Write Hazard!)
+	res, err := h.redis.DecrStockAndEnqueue(r.Context(), req.ProductID, reservationID, req.UserID, ttlSeconds)
 	if err != nil {
 		log.Printf("[REDIS ERROR]: %v\n", err)
 		writeError(w, http.StatusInternalServerError, "Redis error: "+err.Error())
@@ -358,12 +372,25 @@ func (h *Handler) CreateOrderFast(w http.ResponseWriter, r *http.Request) {
 
 	switch res {
 	case 1:
+		// Track start of flash sale burst for stock depletion duration metric
+		saleStartTimes.LoadOrStore(req.ProductID, time.Now())
+
 		// Success: Stock decremented and event enqueued atomically
 		writeJSON(w, http.StatusAccepted, model.FastOrderResponse{
 			Status:        "PENDING",
 			ReservationID: reservationID,
+			TTLSeconds:    ttlSeconds,
 		})
 	case 0:
+		// Record stock depletion duration if this was the transition to 0 stock
+		if val, loaded := saleStartTimes.LoadAndDelete(req.ProductID); loaded {
+			if startTime, ok := val.(time.Time); ok {
+				elapsed := time.Since(startTime).Seconds()
+				metrics.StockDepletionDurationSeconds.WithLabelValues(strconv.Itoa(req.ProductID)).Set(elapsed)
+				log.Printf("[METRICS] Product %d stock completely depleted in %.4f seconds!\n", req.ProductID, elapsed)
+			}
+		}
+
 		// Out of stock: Fast fail! Database is 100% shielded from this traffic.
 		writeError(w, http.StatusGone, "Tükendi (Out of stock)")
 	case -1:
@@ -373,3 +400,150 @@ func (h *Handler) CreateOrderFast(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "Unexpected reservation response")
 	}
 }
+
+// PayOrder handles payment confirmation for a reserved order.
+//
+// EDGE CASE RESOLUTION (TTL & Rollback Defense):
+// If payment arrives within the TTL reservation window:
+// 1. Deletes order:{reservation_id}:ttl in Redis to permanently disarm the expiration rollback trigger.
+// 2. Atomically transitions order status from 'PENDING' to 'PAID' in PostgreSQL.
+// 3. Emits 'OrderPaid' event into outbox_events table.
+//
+// If the customer took longer than the TTL (e.g. 10 minutes):
+// - Key expiration has already fired, stock has been rolled back, and status is 'EXPIRED'.
+// - Rejects payment with HTTP 410 Gone ("Reservation expired").
+func (h *Handler) PayOrder(w http.ResponseWriter, r *http.Request) {
+	var req model.PayOrderRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request payload")
+		return
+	}
+
+	if req.ReservationID == "" {
+		writeError(w, http.StatusBadRequest, "reservation_id is required")
+		return
+	}
+
+	// 1. Query order by reservation_id
+	var orderID, productID int
+	var status, userID string
+	err := h.db.QueryRowContext(r.Context(),
+		"SELECT id, product_id, user_id, status FROM orders WHERE reservation_id = $1",
+		req.ReservationID,
+	).Scan(&orderID, &productID, &userID, &status)
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "Order reservation not found in database")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "Database error: "+err.Error())
+		return
+	}
+
+	if status == "EXPIRED" {
+		writeError(w, http.StatusGone, "Reservation has expired and stock was released back to inventory")
+		return
+	}
+
+	if status == "PAID" || status == "COMPLETED" {
+		writeJSON(w, http.StatusOK, model.PayOrderResponse{
+			ReservationID: req.ReservationID,
+			Status:        status,
+			Message:       "Order is already paid and confirmed (Idempotent response)",
+		})
+		return
+	}
+
+	// 2. Disarm Redis TTL expiration key
+	if h.redis != nil {
+		_ = h.redis.DeleteReservationTTL(r.Context(), req.ReservationID)
+	}
+
+	// 3. Mark order as PAID in PostgreSQL in transaction
+	tx, err := h.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to begin transaction: "+err.Error())
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(r.Context(),
+		"UPDATE orders SET status = 'PAID' WHERE id = $1 AND status = 'PENDING'",
+		orderID,
+	)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to update order status: "+err.Error())
+		return
+	}
+
+	payloadMap := map[string]any{
+		"order_id":       orderID,
+		"reservation_id": req.ReservationID,
+		"product_id":     productID,
+		"user_id":        userID,
+		"paid_at":        time.Now().UTC(),
+	}
+	payloadBytes, _ := json.Marshal(payloadMap)
+
+	_, err = tx.ExecContext(r.Context(),
+		"INSERT INTO outbox_events (id, aggregate_type, payload, status) VALUES ($1, $2, $3, $4)",
+		uuid.New().String(), "OrderPaid", string(payloadBytes), "PROCESSED",
+	)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to record outbox event: "+err.Error())
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to commit payment: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, model.PayOrderResponse{
+		ReservationID: req.ReservationID,
+		Status:        "PAID",
+		Message:       "Payment confirmed and order completed successfully",
+	})
+}
+
+// GetOrder retrieves an order by its numeric ID or reservation UUID.
+func (h *Handler) GetOrder(w http.ResponseWriter, r *http.Request) {
+	idOrUUID := r.PathValue("id")
+	if idOrUUID == "" {
+		writeError(w, http.StatusBadRequest, "order id or reservation_id is required")
+		return
+	}
+
+	var order model.Order
+	var resID sql.NullString
+
+	var err error
+	if _, parseErr := strconv.Atoi(idOrUUID); parseErr == nil {
+		err = h.db.QueryRowContext(r.Context(),
+			"SELECT id, reservation_id, product_id, user_id, status, created_at FROM orders WHERE id = $1",
+			idOrUUID,
+		).Scan(&order.ID, &resID, &order.ProductID, &order.UserID, &order.Status, &order.CreatedAt)
+	} else {
+		err = h.db.QueryRowContext(r.Context(),
+			"SELECT id, reservation_id, product_id, user_id, status, created_at FROM orders WHERE reservation_id = $1",
+			idOrUUID,
+		).Scan(&order.ID, &resID, &order.ProductID, &order.UserID, &order.Status, &order.CreatedAt)
+	}
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "Order not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "Database error: "+err.Error())
+		return
+	}
+
+	if resID.Valid {
+		order.ReservationID = resID.String
+	}
+
+	writeJSON(w, http.StatusOK, order)
+}
+

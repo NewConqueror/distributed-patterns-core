@@ -12,6 +12,7 @@ import (
 	"flashsale/internal/config"
 	"flashsale/internal/database"
 	"flashsale/internal/handler"
+	"flashsale/internal/metrics"
 	"flashsale/internal/worker"
 )
 
@@ -30,18 +31,29 @@ func main() {
 	}
 	defer redisSvc.Client.Close()
 
-	// Start Background Batch Consumer Worker (50ms / 100-item batches)
+	// 1. Start Background Batch Consumer Worker (50ms / 100-item batches)
 	batchConsumer := worker.NewBatchConsumer(cfg, db, redisSvc)
 	batchConsumer.Start(context.Background())
 	defer batchConsumer.Stop()
+
+	// 2. Start Background TTL Expiration & Rollback Worker (Edge Case Defense)
+	expirationWorker := worker.NewExpirationWorker(db, redisSvc)
+	expirationWorker.Start(context.Background())
+	defer expirationWorker.Stop()
+
+	// 3. Register Prometheus DB Connection Pool Metrics
+	metrics.RegisterDBMetrics(db, 1*time.Second)
 
 	mux := http.NewServeMux()
 	h := handler.NewHandler(db, redisSvc)
 	h.RegisterRoutes(mux)
 
+	// Wrap mux with Prometheus metrics middleware
+	instrumentedHandler := metrics.MetricsMiddleware(mux)
+
 	server := &http.Server{
 		Addr:         ":" + cfg.Port,
-		Handler:      mux,
+		Handler:      instrumentedHandler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  60 * time.Second,
