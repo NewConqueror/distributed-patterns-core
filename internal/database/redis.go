@@ -5,23 +5,44 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
+	"time"
 
 	"flashsale/internal/config"
 	"github.com/redis/go-redis/v9"
 )
 
-const defaultDecrStockLua = 
+const OrderStreamKey = "orders:stream"
 
-`local stock = redis.call('GET', KEYS[1])
+const defaultDecrStockLua = `local stock = redis.call('GET', KEYS[1])
 if not stock then
     return -1 -- Ürün bulunamadı
 end
 if tonumber(stock) <= 0 then
     return 0 -- Stok bitti
 end
+
+-- 1. Atomik stok düşümü
 redis.call('DECR', KEYS[1])
+
+-- 2. Atomik olarak Redis Stream'e rezervasyon mesajı yaz (Dual-Write problemini sıfırlar!)
+redis.call('XADD', KEYS[2], '*', 
+    'reservation_id', ARGV[1], 
+    'product_id', ARGV[2], 
+    'user_id', ARGV[3], 
+    'created_at', ARGV[4]
+)
+
 return 1 -- Başarılı
 `
+
+type ReservationEvent struct {
+	StreamID      string
+	ReservationID string
+	ProductID     int
+	UserID        string
+	CreatedAt     time.Time
+}
 
 type RedisService struct {
 	Client       *redis.Client
@@ -89,20 +110,23 @@ func (s *RedisService) GetProductStock(ctx context.Context, productID int) (int,
 	return val, nil
 }
 
-// DecrStock executes the atomic Lua script via EVALSHA
+// DecrStockAndEnqueue executes the atomic Lua script via EVALSHA.
+// It decrements stock AND pushes the reservation to Redis Stream in the exact same atomic transaction,
+// guaranteeing zero dual-write discrepancy.
+//
 // Returns:
 //
-//	 1: Stock successfully decremented
+//	 1: Stock successfully decremented and event enqueued
 //	 0: Out of stock (stock <= 0)
 //	-1: Product key not found in Redis
-func (s *RedisService) DecrStock(ctx context.Context, productID int) (int64, error) {
-	key := ProductStockKey(productID)
+func (s *RedisService) DecrStockAndEnqueue(ctx context.Context, productID int, reservationID, userID string) (int64, error) {
+	productKey := ProductStockKey(productID)
+	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
 
-	res, err := s.Client.EvalSha(ctx, s.decrStockSHA, []string{key}).Result()
+	res, err := s.Client.EvalSha(ctx, s.decrStockSHA, []string{productKey, OrderStreamKey}, reservationID, strconv.Itoa(productID), userID, nowStr).Result()
 	if err != nil {
-		// If NOSCRIPT error occurs, fallback to EVAL
 		if redis.HasErrorPrefix(err, "NOSCRIPT") {
-			res, err = s.Client.Eval(ctx, defaultDecrStockLua, []string{key}).Result()
+			res, err = s.Client.Eval(ctx, defaultDecrStockLua, []string{productKey, OrderStreamKey}, reservationID, strconv.Itoa(productID), userID, nowStr).Result()
 			if err != nil {
 				return 0, err
 			}
@@ -116,4 +140,64 @@ func (s *RedisService) DecrStock(ctx context.Context, productID int) (int64, err
 	}
 
 	return 0, fmt.Errorf("unexpected script result type: %T (%v)", res, res)
+}
+
+// ReadStreamBatch reads up to `count` events from the stream starting after `lastID`.
+func (s *RedisService) ReadStreamBatch(ctx context.Context, lastID string, count int64, block time.Duration) ([]ReservationEvent, string, error) {
+	if lastID == "" {
+		lastID = "0-0"
+	}
+
+	streams, err := s.Client.XRead(ctx, &redis.XReadArgs{
+		Streams: []string{OrderStreamKey, lastID},
+		Count:   count,
+		Block:   block,
+	}).Result()
+
+	if err != nil {
+		if err == redis.Nil {
+			return nil, lastID, nil // Timeout with no new messages
+		}
+		return nil, lastID, err
+	}
+
+	var events []ReservationEvent
+	newLastID := lastID
+
+	for _, stream := range streams {
+		for _, msg := range stream.Messages {
+			newLastID = msg.ID
+
+			event := ReservationEvent{
+				StreamID: msg.ID,
+			}
+
+			if v, ok := msg.Values["reservation_id"].(string); ok {
+				event.ReservationID = v
+			}
+			if v, ok := msg.Values["product_id"].(string); ok {
+				event.ProductID, _ = strconv.Atoi(v)
+			}
+			if v, ok := msg.Values["user_id"].(string); ok {
+				event.UserID = v
+			}
+			if v, ok := msg.Values["created_at"].(string); ok {
+				if t, err := time.Parse(time.RFC3339Nano, v); err == nil {
+					event.CreatedAt = t
+				}
+			}
+			if event.CreatedAt.IsZero() {
+				event.CreatedAt = time.Now().UTC()
+			}
+
+			events = append(events, event)
+		}
+	}
+
+	return events, newLastID, nil
+}
+
+// ClearStream deletes the stream during reset
+func (s *RedisService) ClearStream(ctx context.Context) error {
+	return s.Client.Del(ctx, OrderStreamKey).Err()
 }

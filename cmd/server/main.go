@@ -12,6 +12,7 @@ import (
 	"flashsale/internal/config"
 	"flashsale/internal/database"
 	"flashsale/internal/handler"
+	"flashsale/internal/worker"
 )
 
 func main() {
@@ -28,6 +29,11 @@ func main() {
 		log.Fatalf("[FATAL] Redis initialization failed: %v\n", err)
 	}
 	defer redisSvc.Client.Close()
+
+	// Start Background Batch Consumer Worker (50ms / 100-item batches)
+	batchConsumer := worker.NewBatchConsumer(cfg, db, redisSvc)
+	batchConsumer.Start(context.Background())
+	defer batchConsumer.Stop()
 
 	mux := http.NewServeMux()
 	h := handler.NewHandler(db, redisSvc)

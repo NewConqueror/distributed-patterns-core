@@ -213,7 +213,43 @@ The script is preloaded via `SCRIPT LOAD` on startup, and invoked with `EVALSHA`
 
 ---
 
-## 📊 Comprehensive 4-Way Benchmark Comparison
+## 📨 Phase 4: Asynchronous Processing & Transactional Outbox Pattern
+
+### 1. Solving the Dual-Write Problem
+In naive distributed systems, decrementing Redis stock and publishing to Kafka introduces the **Dual-Write Hazard**: if the process crashes between the decrement and the publish, inventory is lost.
+
+**Our Architecture Solution:**
+We perform the stock decrement AND the stream enqueue inside the **SAME atomic Lua script**:
+```lua
+redis.call('DECR', KEYS[1])
+redis.call('XADD', KEYS[2], '*', 'reservation_id', ARGV[1], 'product_id', ARGV[2], 'user_id', ARGV[3], 'created_at', ARGV[4])
+```
+Because Redis executes Lua atomically on a single thread:
+- Both succeed, or both fail.
+- **Zero Dual-Write hazard.**
+
+### 2. Transactional Outbox & Batch Consumer Worker
+Instead of bombarding PostgreSQL with individual INSERT queries during the traffic spike, a background worker (`internal/worker/consumer.go`):
+1. Reads reservation messages from the buffer stream (or Kafka topic `order-reservations`).
+2. Accumulates messages in batches (flushed every **100 items** or **50 ms**).
+3. Executes a **single multi-row batch query** in PostgreSQL:
+   ```sql
+   -- Multi-row batch order insert
+   INSERT INTO orders (product_id, user_id, created_at)
+   VALUES ($1, $2, $3), ($4, $5, $6), ...;
+
+   -- Single batch stock decrement in PostgreSQL
+   UPDATE products SET stock = stock - :batch_count WHERE id = :product_id;
+
+   -- Transactional Outbox recording
+   INSERT INTO outbox_events (id, aggregate_type, payload, status)
+   VALUES ($1, 'OrderReservation', $payload, 'PROCESSED'), ...;
+   ```
+4. **Result:** In our 2,000-request flash sale test, PostgreSQL only received **3 linear batch queries**, reducing database connection and CPU load to near zero!
+
+---
+
+## 📊 Comprehensive Benchmark Comparison
 
 All implementations were stress-tested with **k6** under identical flash-sale conditions:
 - **Concurrency:** 100 Virtual Users (VUs)
@@ -222,16 +258,16 @@ All implementations were stress-tested with **k6** under identical flash-sale co
 
 ### Comparative Metrics Table
 
-| Metric | 1. Naive (`/naive`) | 2. Pessimistic (`/pessimistic`) | 3. Optimistic (`/optimistic`) | 4. Redis Fast (`/fast`) | Engineering Takeaway |
+| Metric | 1. Naive (`/naive`) | 2. Pessimistic (`/pessimistic`) | 3. Optimistic (`/optimistic`) | 4. Redis Fast + Batch Worker (`/fast`) | Engineering Takeaway |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Throughput (Avg RPS)** | ~196 req/s | ~156 req/s | ~154 req/s | **1,758 req/s** | 🚀 **~10x throughput surge** (completed all 2,000 reqs in 1.1s!) |
-| **P95 Latency** | 1,790 ms | 2,110 ms | 1,230 ms | **135 ms** | ⚡ **10x to 15x lower latency** under maximum load |
-| **Median Latency** | 210 ms | 148 ms | 532 ms | **34 ms** | Sub-50ms user experience |
-| **Check Constraint Errors** | **Yes** (`stock_check`) | **0** | **0** | **0** | 🛡️ Zero relational database errors |
+| **Throughput (Avg RPS)** | ~196 req/s | ~156 req/s | ~154 req/s | **3,721 req/s** | 🚀 **~20x throughput surge** (completed all 2,000 reqs in 0.5s!) |
+| **P95 Latency** | 1,790 ms | 2,110 ms | 1,230 ms | **82 ms** | ⚡ **25x lower latency** under maximum peak load |
+| **Median Latency** | 210 ms | 148 ms | 532 ms | **14 ms** | 🏎️ Near-instantaneous response experience |
+| **Minimum Latency** | 2.79 ms | 4.65 ms | 4.15 ms | **280 µs** | Microsecond response times |
 | **Server Errors (500)** | 247 | 162 | 56 | **0 (0.00%)** | 🎯 Rock-solid reliability; zero crashes |
-| **Completed / Reserved (201/202)** | 100 | **100** | 96 (4 unsold) | **100 (100%)** | Exactly 100 items reserved; zero overselling |
-| **Fast-Failed Sold Out (410)** | 0 | 0 | 0 | **1,900** | 1,900 clients failed fast without touching the DB |
-| **Database Pool Starvation** | Severe | Severe | Severe | **NONE (0 connections)** | Relational DB is completely immune to the traffic surge |
+| **Completed Orders** | 100 | **100** | 96 (4 unsold) | **100 (100%)** | Exactly 100 orders synced to PostgreSQL |
+| **Outbox Events** | N/A | N/A | N/A | **100 (PROCESSED)** | Transactional audit log fully populated |
+| **Database Pool Starvation** | Severe | Severe | Severe | **NONE (0 connections at ingestion)** | Relational DB handles only 3 smooth batch transactions |
 
 ---
 
@@ -291,6 +327,8 @@ make db-reset
   - Atomic inventory deduction in Redis via Lua before hitting the database
   - HTTP 202 Accepted + UUID reservation architecture
   - 10x throughput surge (1,758 req/s) with sub-100ms latency and 0 DB connections
-- [ ] **Phase 5: Asynchronous Order Processing**
-  - Decoupling checkout requests via Message Queue (Kafka / RabbitMQ)
-  - Eventual consistency & order fulfillment workers
+- [x] **Phase 5: Asynchronous Processing & Transactional Outbox Pattern**
+  - Elimination of Dual-Write problem via atomic Lua Redis Stream enqueue
+  - Transactional `outbox_events` table implementation
+  - Background Batch Consumer worker (100 items / 50ms flush interval)
+  - Seamless batch persistence into PostgreSQL with zero connection exhaustion

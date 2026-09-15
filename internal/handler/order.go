@@ -344,8 +344,12 @@ func (h *Handler) CreateOrderFast(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Execute preloaded atomic Lua script on Redis via EVALSHA
-	res, err := h.redis.DecrStock(r.Context(), req.ProductID)
+	// 1. Generate unique reservation_id (UUID)
+	reservationID := uuid.New().String()
+
+	// 2. Execute preloaded atomic Lua script on Redis via EVALSHA
+	// Decrements stock AND appends to Redis Stream in ONE atomic step (Zero Dual-Write Hazard!)
+	res, err := h.redis.DecrStockAndEnqueue(r.Context(), req.ProductID, reservationID, req.UserID)
 	if err != nil {
 		log.Printf("[REDIS ERROR]: %v\n", err)
 		writeError(w, http.StatusInternalServerError, "Redis error: "+err.Error())
@@ -354,8 +358,7 @@ func (h *Handler) CreateOrderFast(w http.ResponseWriter, r *http.Request) {
 
 	switch res {
 	case 1:
-		// Success: Stock decremented atomically in Redis
-		reservationID := uuid.New().String()
+		// Success: Stock decremented and event enqueued atomically
 		writeJSON(w, http.StatusAccepted, model.FastOrderResponse{
 			Status:        "PENDING",
 			ReservationID: reservationID,

@@ -20,6 +20,8 @@ type Config struct {
 	RedisHost      string
 	RedisPort      string
 	RedisPassword  string
+	KafkaBrokers   string
+	KafkaTopic     string
 }
 
 func Load() *Config {
@@ -37,6 +39,8 @@ func Load() *Config {
 		RedisHost:      getEnv("REDIS_HOST", "localhost"),
 		RedisPort:      getEnv("REDIS_PORT", "6379"),
 		RedisPassword:  os.Getenv("REDIS_PASSWORD"),
+		KafkaBrokers:   os.Getenv("KAFKA_BROKERS"),
+		KafkaTopic:     getEnv("KAFKA_TOPIC", "order-reservations"),
 	}
 }
 

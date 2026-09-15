@@ -86,16 +86,19 @@ func (h *Handler) ResetProductStock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	_, _ = tx.ExecContext(r.Context(), "DELETE FROM outbox_events")
+
 	if err := tx.Commit(); err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to commit reset: "+err.Error())
 		return
 	}
 
-	// Synchronize Redis cache key
+	// Synchronize Redis cache key and clear stream
 	if h.redis != nil {
 		if err := h.redis.InitProductStock(r.Context(), id, targetStock); err != nil {
 			log.Printf("[REDIS ERROR - Reset Stock]: %v\n", err)
 		}
+		_ = h.redis.ClearStream(r.Context())
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
