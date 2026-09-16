@@ -25,7 +25,55 @@ func main() {
 	initLat := flag.Float64("lat", 41.0082, "Starting latitude (default: Istanbul 41.0082)")
 	initLon := flag.Float64("lon", 28.9784, "Starting longitude (default: Istanbul 28.9784)")
 	initSpeed := flag.Float64("speed", 55.0, "Vehicle cruising speed in km/h")
+	queryMode := flag.Bool("query", false, "Query nearby drivers instead of streaming telemetry")
+	queryRadius := flag.Float64("radius", 5.0, "Search radius in km for query mode")
+	queryLimit := flag.Int("limit", 10, "Max drivers to return in query mode")
 	flag.Parse()
+
+	// Connect to gRPC server
+	conn, err := grpc.NewClient(*serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatalf("Failed to connect to gRPC server %s: %v", *serverAddr, err)
+	}
+	defer conn.Close()
+
+	client := telemetryv1.NewTelemetryServiceClient(conn)
+
+	// If query mode is requested, execute GetNearbyDrivers and exit
+	if *queryMode {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		req := &telemetryv1.RadiusQuery{
+			Latitude:  *initLat,
+			Longitude: *initLon,
+			RadiusKm:  *queryRadius,
+			Limit:     int32(*queryLimit),
+		}
+
+		res, err := client.GetNearbyDrivers(ctx, req)
+		if err != nil {
+			log.Fatalf("Failed to query nearby drivers: %v", err)
+		}
+
+		fmt.Println("=======================================================")
+		fmt.Println("       GeoPulse Spatial Radius Query Result            ")
+		fmt.Println("=======================================================")
+		fmt.Printf(" Search Center  : (%.6f, %.6f)\n", *initLat, *initLon)
+		fmt.Printf(" Search Radius  : %.2f km\n", *queryRadius)
+		fmt.Printf(" Drivers Found  : %d\n", len(res.Drivers))
+		fmt.Printf(" Server Time    : %v\n", time.UnixMilli(res.SearchTimestamp).Format(time.RFC3339))
+		fmt.Println("------------------------------------------------------------------------------------------------")
+		fmt.Printf("%-3s | %-20s | %-9s | %-23s | %-12s | %-8s\n",
+			"#", "Driver ID", "Dist (km)", "Coordinates (Lat, Lon)", "Speed (km/h)", "Heading")
+		fmt.Println("------------------------------------------------------------------------------------------------")
+		for i, d := range res.Drivers {
+			fmt.Printf("%-3d | %-20s | %9.3f | (%9.6f, %9.6f) | %12.1f | %7.1f°\n",
+				i+1, d.DriverId, d.DistanceKm, d.Latitude, d.Longitude, d.Speed, d.Bearing)
+		}
+		fmt.Println("================================================================================================")
+		return
+	}
 
 	if *rate <= 0 {
 		*rate = 10
@@ -44,15 +92,6 @@ func main() {
 		fmt.Println(" Duration       : Continuous (Press Ctrl+C to stop)")
 	}
 	fmt.Println("=======================================================")
-
-	// Connect to gRPC server
-	conn, err := grpc.NewClient(*serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Fatalf("Failed to connect to gRPC server %s: %v", *serverAddr, err)
-	}
-	defer conn.Close()
-
-	client := telemetryv1.NewTelemetryServiceClient(conn)
 
 	// Context for gRPC stream lifecycle
 	streamCtx, streamCancel := context.WithCancel(context.Background())

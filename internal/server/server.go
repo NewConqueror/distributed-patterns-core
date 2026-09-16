@@ -13,6 +13,7 @@ import (
 	telemetryv1 "geopulse/gen/go/telemetry/v1"
 	"geopulse/internal/buffer"
 	"geopulse/internal/ingestion"
+	"geopulse/internal/spatial"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 )
@@ -23,6 +24,10 @@ type Config struct {
 	BufferCapacity int
 	NumWorkers     int
 	DropStrategy   buffer.DropStrategy
+
+	// Redis Hot Path & Geospatial settings
+	EnableRedis bool
+	RedisCfg    spatial.RedisConfig
 }
 
 // Run boots up the gRPC ingestion server with worker pool and graceful shutdown.
@@ -37,6 +42,7 @@ func Run(cfg Config, logger *slog.Logger) error {
 		"port", cfg.Port,
 		"buffer_capacity", cfg.BufferCapacity,
 		"workers", cfg.NumWorkers,
+		"redis_enabled", cfg.EnableRedis,
 	)
 
 	ingestionCfg := ingestion.Config{
@@ -47,6 +53,34 @@ func Run(cfg Config, logger *slog.Logger) error {
 	server := ingestion.NewTelemetryServer(ingestionCfg, logger)
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Initialize and bind Redis Hot Path if enabled
+	var sweeper *spatial.Sweeper
+	if cfg.EnableRedis {
+		redisClient, err := spatial.NewRedisClient(cfg.RedisCfg, logger)
+		if err != nil {
+			server.Stop()
+			return fmt.Errorf("failed initializing Redis spatial layer: %w", err)
+		}
+		defer func() {
+			_ = redisClient.Close()
+		}()
+
+		geoStore := spatial.NewGeoStore(redisClient, cfg.RedisCfg, nil, logger)
+		sweeper = spatial.NewSweeper(redisClient, cfg.RedisCfg, logger)
+
+		// Hook into worker pool for hot-path spatial indexing & pubsub fan-out
+		server.WorkerPool().RegisterHook(geoStore.ProcessPing)
+
+		// Hook into TelemetryServer for radius queries
+		server.SetSpatialQuerier(geoStore)
+
+		// Start background sweeper for ghost driver cleanup
+		sweeper.Start(ctx)
+		defer sweeper.Stop()
+	}
+
 	server.Start(ctx)
 
 	grpcServer := grpc.NewServer(
@@ -64,7 +98,6 @@ func Run(cfg Config, logger *slog.Logger) error {
 	addr := fmt.Sprintf(":%d", cfg.Port)
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		cancel()
 		server.Stop()
 		return fmt.Errorf("failed to listen on %s: %w", addr, err)
 	}
@@ -87,12 +120,17 @@ func Run(cfg Config, logger *slog.Logger) error {
 			case <-ticker.C:
 				m := server.Metrics().Snapshot()
 				b := server.Buffer().Stats()
+				pruned := int64(0)
+				if sweeper != nil {
+					pruned = sweeper.TotalPruned()
+				}
 				logger.Info("Engine Telemetry Metrics",
 					"active_streams", m.ActiveStreams,
 					"total_received", m.TotalReceived,
 					"total_processed", m.TotalProcessed,
 					"dropped_oldest", m.TotalDroppedOldest,
 					"buffer_depth", b.CurrentDepth,
+					"stale_pruned", pruned,
 				)
 			}
 		}

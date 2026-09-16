@@ -17,3 +17,7 @@ bin/
 *.swp
 *~
 .DS_Store
+
+# Redis dump
+*.rdb
+dump.rdb

@@ -11,14 +11,20 @@ import (
 	"geopulse/internal/buffer"
 )
 
+// SpatialQuerier defines the contract for geospatial radius searches.
+type SpatialQuerier interface {
+	GetNearbyDrivers(ctx context.Context, req *telemetryv1.RadiusQuery) (*telemetryv1.DriverList, error)
+}
+
 // TelemetryServer implements telemetryv1.TelemetryServiceServer.
 type TelemetryServer struct {
 	telemetryv1.UnimplementedTelemetryServiceServer
 
-	buffer     *buffer.RingBuffer
-	workerPool *WorkerPool
-	metrics    *Metrics
-	logger     *slog.Logger
+	buffer         *buffer.RingBuffer
+	workerPool     *WorkerPool
+	metrics        *Metrics
+	logger         *slog.Logger
+	spatialQuerier SpatialQuerier
 }
 
 // Config holds configuration parameters for the ingestion server.
@@ -151,9 +157,18 @@ func (s *TelemetryServer) StreamLocation(stream telemetryv1.TelemetryService_Str
 	}
 }
 
-// GetNearbyDrivers is a stubbed query handler to be fully powered by Redis Geospatial in Phase 3.
+// SetSpatialQuerier binds a spatial query backend (e.g. Redis GeoStore).
+func (s *TelemetryServer) SetSpatialQuerier(q SpatialQuerier) {
+	s.spatialQuerier = q
+}
+
+// GetNearbyDrivers queries active drivers within a given radius using the registered spatial backend.
 func (s *TelemetryServer) GetNearbyDrivers(ctx context.Context, req *telemetryv1.RadiusQuery) (*telemetryv1.DriverList, error) {
-	s.logger.Info("Received GetNearbyDrivers request (stub)",
+	if s.spatialQuerier != nil {
+		return s.spatialQuerier.GetNearbyDrivers(ctx, req)
+	}
+
+	s.logger.Info("Received GetNearbyDrivers request (no spatial querier registered)",
 		"lat", req.Latitude,
 		"lon", req.Longitude,
 		"radius_km", req.RadiusKm,
