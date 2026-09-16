@@ -1,4 +1,4 @@
-.PHONY: all proto build test benchmark clean help
+.PHONY: all proto build test benchmark clean run-server run-sim help
 
 PROTOC ?= protoc
 PROTO_DIR = proto
@@ -16,11 +16,20 @@ proto:
 	@echo "==> Protobuf code generation completed successfully."
 
 build:
-	@echo "==> Building GeoPulse binary..."
-	go build -v -o bin/geopulse main.go
+	@echo "==> Building GeoPulse Server and Simulator binaries..."
+	@mkdir -p bin
+	go build -v -o bin/geopulse-server cmd/server/main.go
+	go build -v -o bin/geopulse-sim cmd/simulator/main.go
+	@echo "==> Binaries generated in bin/"
+
+run-server:
+	go run cmd/server/main.go
+
+run-sim:
+	go run cmd/simulator/main.go -rate 10 -duration 10s
 
 test:
-	@echo "==> Running unit and comparison tests..."
+	@echo "==> Running all unit & integration tests..."
 	go test -v ./...
 
 benchmark:
@@ -32,9 +41,11 @@ clean:
 	rm -rf bin/ $(GEN_DIR)
 
 help:
-	@echo "GeoPulse Makefile Commands:"
-	@echo "  make proto      - Compile .proto definitions into Go gRPC & protobuf code"
-	@echo "  make build      - Compile the Go project binary to bin/geopulse"
-	@echo "  make test       - Execute all unit tests including payload comparison"
-	@echo "  make benchmark  - Run serialization benchmarks (speed, allocs, wire size)"
-	@echo "  make clean      - Remove build outputs and generated protobuf files"
+	@echo "GeoPulse Build System:"
+	@echo "  make proto       - Compile .proto definitions into Go gRPC & protobuf code"
+	@echo "  make build       - Compile the server and simulator binaries to bin/"
+	@echo "  make test        - Run all unit and integration tests"
+	@echo "  make benchmark   - Run serialization benchmarks (speed, allocs, wire size)"
+	@echo "  make run-server  - Run gRPC ingestion server locally"
+	@echo "  make run-sim     - Run mock client simulator (10 pings/sec for 10s)"
+	@echo "  make clean       - Remove build outputs and generated protobuf files"
