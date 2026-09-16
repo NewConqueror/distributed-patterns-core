@@ -13,6 +13,7 @@ import (
 	telemetryv1 "geopulse/gen/go/telemetry/v1"
 	"geopulse/internal/buffer"
 	"geopulse/internal/ingestion"
+	"geopulse/internal/persistence"
 	"geopulse/internal/spatial"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
@@ -28,6 +29,11 @@ type Config struct {
 	// Redis Hot Path & Geospatial settings
 	EnableRedis bool
 	RedisCfg    spatial.RedisConfig
+
+	// PostgreSQL Cold Path Batch Persistence settings
+	EnablePostgres bool
+	PostgresCfg    persistence.PostgresConfig
+	BatchCfg       persistence.BatchConfig
 }
 
 // Run boots up the gRPC ingestion server with worker pool and graceful shutdown.
@@ -43,6 +49,7 @@ func Run(cfg Config, logger *slog.Logger) error {
 		"buffer_capacity", cfg.BufferCapacity,
 		"workers", cfg.NumWorkers,
 		"redis_enabled", cfg.EnableRedis,
+		"postgres_enabled", cfg.EnablePostgres,
 	)
 
 	ingestionCfg := ingestion.Config{
@@ -55,7 +62,7 @@ func Run(cfg Config, logger *slog.Logger) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Initialize and bind Redis Hot Path if enabled
+	// 1. Initialize and bind Redis Hot Path if enabled
 	var sweeper *spatial.Sweeper
 	if cfg.EnableRedis {
 		redisClient, err := spatial.NewRedisClient(cfg.RedisCfg, logger)
@@ -79,6 +86,30 @@ func Run(cfg Config, logger *slog.Logger) error {
 		// Start background sweeper for ghost driver cleanup
 		sweeper.Start(ctx)
 		defer sweeper.Stop()
+	}
+
+	// 2. Initialize and bind PostgreSQL Cold Path Batch Engine if enabled
+	var batchEngine *persistence.BatchEngine
+	if cfg.EnablePostgres {
+		repo, err := persistence.NewPostgresRepository(cfg.PostgresCfg, cfg.BatchCfg, logger)
+		if err != nil {
+			server.Stop()
+			return fmt.Errorf("failed initializing PostgreSQL repository: %w", err)
+		}
+
+		if err := repo.InitSchema(ctx); err != nil {
+			repo.Close()
+			server.Stop()
+			return fmt.Errorf("failed initializing database schema: %w", err)
+		}
+
+		batchEngine = persistence.NewBatchEngine(repo, cfg.BatchCfg, logger)
+
+		// Hook into worker pool for asynchronous decoupled batch persistence
+		server.WorkerPool().RegisterHook(batchEngine.ProcessPing)
+
+		batchEngine.Start(ctx)
+		defer batchEngine.Stop()
 	}
 
 	server.Start(ctx)
@@ -124,6 +155,10 @@ func Run(cfg Config, logger *slog.Logger) error {
 				if sweeper != nil {
 					pruned = sweeper.TotalPruned()
 				}
+				var bm persistence.Metrics
+				if batchEngine != nil {
+					bm = batchEngine.Metrics()
+				}
 				logger.Info("Engine Telemetry Metrics",
 					"active_streams", m.ActiveStreams,
 					"total_received", m.TotalReceived,
@@ -131,6 +166,9 @@ func Run(cfg Config, logger *slog.Logger) error {
 					"dropped_oldest", m.TotalDroppedOldest,
 					"buffer_depth", b.CurrentDepth,
 					"stale_pruned", pruned,
+					"db_flushed", bm.TotalFlushed,
+					"db_batches", bm.TotalBatches,
+					"db_errors", bm.TotalErrors,
 				)
 			}
 		}
