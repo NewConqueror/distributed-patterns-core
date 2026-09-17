@@ -23,6 +23,12 @@ type Limiter interface {
 	Close() error
 }
 
+// DynamicLimiter allows evaluating rate limits with dynamic capacity, window, and refill rates.
+type DynamicLimiter interface {
+	Limiter
+	AllowRule(ctx context.Context, key string, capacity int64, window time.Duration, rate float64) (*Result, error)
+}
+
 // MemoryConfig defines the operational parameters for an In-Memory rate limiter.
 type MemoryConfig struct {
 	Rate            float64       // Replenishment rate (tokens per second)

@@ -55,16 +55,28 @@ func NewFallbackLimiter(cfg FallbackLimiterConfig) *FallbackLimiter {
 
 // Allow executes rate limit evaluation with automatic fallback protection.
 func (f *FallbackLimiter) Allow(ctx context.Context, key string) (*Result, error) {
+	return f.AllowRule(ctx, key, 0, 0, 0)
+}
+
+// AllowRule executes rate limit evaluation with dynamic parameters and fallback protection.
+func (f *FallbackLimiter) AllowRule(ctx context.Context, key string, capacity int64, window time.Duration, rate float64) (*Result, error) {
 	nowNano := time.Now().UnixNano()
 	openUntil := f.circuitOpenUntil.Load()
 
 	// 1. If circuit is OPEN (cooling down after Redis outage), bypass primary to avoid latency spikes
 	if nowNano < openUntil {
-		return f.execFallback(ctx, key, nil)
+		return f.execFallback(ctx, key, capacity, window, rate, nil)
 	}
 
 	// 2. Attempt evaluation on Primary (Distributed Redis)
-	res, err := f.cfg.Primary.Allow(ctx, key)
+	var res *Result
+	var err error
+	if dyn, ok := f.cfg.Primary.(DynamicLimiter); ok && capacity > 0 {
+		res, err = dyn.AllowRule(ctx, key, capacity, window, rate)
+	} else {
+		res, err = f.cfg.Primary.Allow(ctx, key)
+	}
+
 	if err == nil {
 		// Successful primary call: reset consecutive error count
 		f.consecutiveErrors.Store(0)
@@ -78,14 +90,20 @@ func (f *FallbackLimiter) Allow(ctx context.Context, key string) (*Result, error
 	}
 
 	// 4. Failover to local in-memory fallback
-	return f.execFallback(ctx, key, err)
+	return f.execFallback(ctx, key, capacity, window, rate, err)
 }
 
-func (f *FallbackLimiter) execFallback(ctx context.Context, key string, primaryErr error) (*Result, error) {
+func (f *FallbackLimiter) execFallback(ctx context.Context, key string, capacity int64, window time.Duration, rate float64, primaryErr error) (*Result, error) {
 	f.fallbackCount.Add(1)
 
 	if f.cfg.Fallback != nil {
-		res, err := f.cfg.Fallback.Allow(ctx, key)
+		var res *Result
+		var err error
+		if dyn, ok := f.cfg.Fallback.(DynamicLimiter); ok && capacity > 0 {
+			res, err = dyn.AllowRule(ctx, key, capacity, window, rate)
+		} else {
+			res, err = f.cfg.Fallback.Allow(ctx, key)
+		}
 		if err == nil {
 			return res, nil
 		}

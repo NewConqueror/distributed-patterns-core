@@ -46,18 +46,30 @@ func NewRedisSlidingWindowLimiter(cfg RedisConfig) *RedisSlidingWindowLimiter {
 	}
 }
 
-// Allow executes the sliding window evaluation in Redis in a single RTT round trip.
+// Allow executes the sliding window evaluation in Redis using default configuration limits.
 func (r *RedisSlidingWindowLimiter) Allow(ctx context.Context, key string) (*Result, error) {
+	return r.AllowRule(ctx, key, r.cfg.Limit, r.cfg.Window, 0)
+}
+
+// AllowRule executes the sliding window evaluation in Redis with dynamic per-rule capacity and window duration.
+func (r *RedisSlidingWindowLimiter) AllowRule(ctx context.Context, key string, limit int64, window time.Duration, _ float64) (*Result, error) {
+	if limit <= 0 {
+		limit = r.cfg.Limit
+	}
+	if window <= 0 {
+		window = r.cfg.Window
+	}
+
 	// Use Redis hash tag {...} around key to ensure compatibility with Redis Cluster
 	redisKey := fmt.Sprintf("%s:{%s}", r.cfg.KeyPrefix, key)
 
 	nowMs := time.Now().UnixMilli()
-	windowMs := r.cfg.Window.Milliseconds()
+	windowMs := window.Milliseconds()
 	if windowMs < 1 {
 		windowMs = 1
 	}
 
-	rawRes, err := r.script.Run(ctx, r.client, []string{redisKey}, r.cfg.Limit, windowMs, nowMs, 1).Slice()
+	rawRes, err := r.script.Run(ctx, r.client, []string{redisKey}, limit, windowMs, nowMs, 1).Slice()
 	if err != nil {
 		return nil, fmt.Errorf("redis sliding window script execution failed: %w", err)
 	}
@@ -76,7 +88,7 @@ func (r *RedisSlidingWindowLimiter) Allow(ctx context.Context, key string) (*Res
 
 	return &Result{
 		Allowed:    allowedVal == 1,
-		Limit:      r.cfg.Limit,
+		Limit:      limit,
 		Remaining:  remainingVal,
 		ResetTime:  resetTime,
 		RetryAfter: retryAfter,

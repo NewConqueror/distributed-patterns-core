@@ -10,6 +10,7 @@ import (
 )
 
 type tokenBucket struct {
+	capacity   int64
 	tokens     float64
 	lastRefill time.Time
 	lastSeen   time.Time
@@ -70,10 +71,22 @@ func (m *MemoryLimiter) getShard(key string) *memoryShard {
 	return m.shards[h&m.mask]
 }
 
-// Allow executes the Token Bucket rate limit check for the provided key.
+// Allow executes the Token Bucket rate limit check using the default configured limits.
 func (m *MemoryLimiter) Allow(ctx context.Context, key string) (*Result, error) {
+	return m.AllowRule(ctx, key, m.cfg.Capacity, 0, m.cfg.Rate)
+}
+
+// AllowRule executes the Token Bucket rate limit check with custom per-rule capacity and rate.
+func (m *MemoryLimiter) AllowRule(ctx context.Context, key string, capacity int64, _ time.Duration, rate float64) (*Result, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+
+	if capacity <= 0 {
+		capacity = m.cfg.Capacity
+	}
+	if rate <= 0 {
+		rate = m.cfg.Rate
 	}
 
 	shard := m.getShard(key)
@@ -84,17 +97,26 @@ func (m *MemoryLimiter) Allow(ctx context.Context, key string) (*Result, error) 
 	b, exists := shard.buckets[key]
 	if !exists {
 		b = &tokenBucket{
-			tokens:     float64(m.cfg.Capacity),
+			capacity:   capacity,
+			tokens:     float64(capacity),
 			lastRefill: now,
 			lastSeen:   now,
 		}
 		shard.buckets[key] = b
+	} else if b.capacity != capacity {
+		// Handle dynamic rule hot-reload capacity change
+		if capacity > b.capacity {
+			b.tokens += float64(capacity - b.capacity)
+		} else if b.tokens > float64(capacity) {
+			b.tokens = float64(capacity)
+		}
+		b.capacity = capacity
 	}
 
 	// Calculate token replenishment
 	elapsed := now.Sub(b.lastRefill).Seconds()
 	if elapsed > 0 {
-		b.tokens = math.Min(float64(m.cfg.Capacity), b.tokens+(elapsed*m.cfg.Rate))
+		b.tokens = math.Min(float64(capacity), b.tokens+(elapsed*rate))
 		b.lastRefill = now
 	}
 	b.lastSeen = now
@@ -105,16 +127,16 @@ func (m *MemoryLimiter) Allow(ctx context.Context, key string) (*Result, error) 
 
 		// Estimate when bucket reaches full capacity
 		var resetTime time.Time
-		if m.cfg.Rate > 0 {
-			remainingToFull := float64(m.cfg.Capacity) - b.tokens
-			resetTime = now.Add(time.Duration((remainingToFull / m.cfg.Rate) * float64(time.Second)))
+		if rate > 0 {
+			remainingToFull := float64(capacity) - b.tokens
+			resetTime = now.Add(time.Duration((remainingToFull / rate) * float64(time.Second)))
 		} else {
 			resetTime = now
 		}
 
 		return &Result{
 			Allowed:    true,
-			Limit:      m.cfg.Capacity,
+			Limit:      capacity,
 			Remaining:  int64(b.tokens),
 			ResetTime:  resetTime,
 			RetryAfter: 0,
@@ -123,9 +145,9 @@ func (m *MemoryLimiter) Allow(ctx context.Context, key string) (*Result, error) 
 
 	// Reject request: compute Retry-After until 1 token is generated
 	var retryAfter time.Duration
-	if m.cfg.Rate > 0 {
+	if rate > 0 {
 		needed := 1.0 - b.tokens
-		retryAfter = time.Duration((needed / m.cfg.Rate) * float64(time.Second))
+		retryAfter = time.Duration((needed / rate) * float64(time.Second))
 		if retryAfter <= 0 {
 			retryAfter = time.Millisecond
 		}
@@ -133,7 +155,7 @@ func (m *MemoryLimiter) Allow(ctx context.Context, key string) (*Result, error) 
 
 	return &Result{
 		Allowed:    false,
-		Limit:      m.cfg.Capacity,
+		Limit:      capacity,
 		Remaining:  0,
 		ResetTime:  now.Add(retryAfter),
 		RetryAfter: retryAfter,
