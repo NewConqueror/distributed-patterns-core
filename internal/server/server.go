@@ -13,6 +13,7 @@ import (
 	telemetryv1 "geopulse/gen/go/telemetry/v1"
 	"geopulse/internal/buffer"
 	"geopulse/internal/ingestion"
+	"geopulse/internal/metrics"
 	"geopulse/internal/persistence"
 	"geopulse/internal/spatial"
 	"google.golang.org/grpc"
@@ -25,6 +26,9 @@ type Config struct {
 	BufferCapacity int
 	NumWorkers     int
 	DropStrategy   buffer.DropStrategy
+
+	// Prometheus Metrics HTTP port (default: 2112)
+	MetricsPort int
 
 	// Redis Hot Path & Geospatial settings
 	EnableRedis bool
@@ -61,6 +65,18 @@ func Run(cfg Config, logger *slog.Logger) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// 0. Start Prometheus HTTP metrics server if configured
+	var metricsServer *metrics.Server
+	if cfg.MetricsPort > 0 {
+		metricsAddr := fmt.Sprintf(":%d", cfg.MetricsPort)
+		metricsServer = metrics.StartMetricsServer(metricsAddr, logger)
+		defer func() {
+			sCtx, sCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer sCancel()
+			_ = metricsServer.Stop(sCtx)
+		}()
+	}
 
 	// 1. Initialize and bind Redis Hot Path if enabled
 	var sweeper *spatial.Sweeper

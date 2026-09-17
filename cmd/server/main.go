@@ -13,6 +13,7 @@ import (
 
 func main() {
 	port := flag.Int("port", 50051, "Port to listen on")
+	metricsPort := flag.Int("metrics-port", 2112, "HTTP port to expose Prometheus /metrics endpoint (0 to disable)")
 	bufferCap := flag.Int("buffer-cap", 10000, "Ring buffer capacity for ingestion backpressure")
 	numWorkers := flag.Int("workers", 4, "Number of concurrent ingestion workers")
 
@@ -64,6 +65,7 @@ func main() {
 
 	cfg := server.Config{
 		Port:           *port,
+		MetricsPort:    *metricsPort,
 		BufferCapacity: *bufferCap,
 		NumWorkers:     *numWorkers,
 		DropStrategy:   buffer.DropOldest,

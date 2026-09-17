@@ -8,6 +8,7 @@ import (
 	"time"
 
 	telemetryv1 "geopulse/gen/go/telemetry/v1"
+	"geopulse/internal/metrics"
 )
 
 // Metrics exposes observable execution statistics for the batch persistence pipeline.
@@ -158,14 +159,21 @@ func (e *BatchEngine) writeBatch(ctx context.Context, batch []*TelemetryRecord) 
 		return
 	}
 
-	if err := e.repo.BulkInsert(ctx, batch); err != nil {
+	start := time.Now()
+	err := e.repo.BulkInsert(ctx, batch)
+	duration := time.Since(start).Seconds()
+	metrics.Default().BatchFlushDuration.Observe(duration)
+
+	if err != nil {
 		e.totalErrors.Add(1)
+		metrics.Default().BatchFlushErrors.Inc()
 		e.logger.Error("Batch persistence failed", "err", err, "records", len(batch))
 		return
 	}
 
 	e.totalBatches.Add(1)
 	e.totalFlushed.Add(int64(len(batch)))
+	metrics.Default().BatchFlushRecords.Add(float64(len(batch)))
 }
 
 // Stop initiates graceful shutdown, flushing any remaining in-memory records to PostgreSQL.

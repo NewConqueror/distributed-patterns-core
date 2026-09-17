@@ -7,6 +7,7 @@ import (
 
 	telemetryv1 "geopulse/gen/go/telemetry/v1"
 	"geopulse/internal/buffer"
+	"geopulse/internal/metrics"
 )
 
 // ProcessHook is an optional callback invoked by workers when a ping is dequeued.
@@ -110,4 +111,5 @@ func (wp *WorkerPool) processPing(workerID int, ping *telemetryv1.LocationPing) 
 	}
 
 	wp.metrics.TotalProcessed.Add(1)
+	metrics.Default().LocationPings.WithLabelValues("processed").Inc()
 }

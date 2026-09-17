@@ -1,0 +1,98 @@
+services:
+  # ===================================================================
+  # 1. PostgreSQL with PostGIS Geospatial Extension
+  # ===================================================================
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: geopulse-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-geopulse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-geopulse_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-geopulse}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-geopulse} -d ${POSTGRES_DB:-geopulse}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ===================================================================
+  # 2. Redis v7 (Hot-Path In-Memory Spatial Sorted Sets & Pub/Sub)
+  # ===================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: geopulse-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --save 60 1 --loglevel notice
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ===================================================================
+  # 3. GeoPulse Core Ingestion Engine (Go gRPC Server)
+  # ===================================================================
+  geopulse-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: geopulse-server
+    restart: unless-stopped
+    ports:
+      - "50051:50051" # gRPC Ingestion Port
+      - "2112:2112"   # Prometheus Metrics HTTP Port
+    command:
+      - "/app/geopulse-server"
+      - "-port"
+      - "50051"
+      - "-metrics-port"
+      - "2112"
+      - "-redis-addr"
+      - "redis:6379"
+      - "-pg-host"
+      - "postgres"
+      - "-pg-port"
+      - "5432"
+      - "-pg-user"
+      - "${POSTGRES_USER:-geopulse}"
+      - "-pg-pass"
+      - "${POSTGRES_PASSWORD:-geopulse_secret}"
+      - "-pg-db"
+      - "${POSTGRES_DB:-geopulse}"
+      - "-batch-size"
+      - "250"
+      - "-batch-interval"
+      - "3s"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ===================================================================
+  # 4. Prometheus Observability Engine
+  # ===================================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: geopulse-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - geopulse-server
+
+volumes:
+  postgres_data:
+  redis_data:

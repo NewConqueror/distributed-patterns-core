@@ -8,6 +8,7 @@ import (
 	"time"
 
 	telemetryv1 "geopulse/gen/go/telemetry/v1"
+	"geopulse/internal/metrics"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/protobuf/proto"
 )
@@ -51,6 +52,8 @@ func (s *GeoStore) Config() RedisConfig {
 // ProcessPing implements the ingestion.ProcessHook signature. It updates the
 // Redis spatial index and immediately broadcasts the ping to the regional pub/sub channel.
 func (s *GeoStore) ProcessPing(ctx context.Context, ping *telemetryv1.LocationPing) error {
+	start := time.Now()
+
 	if err := s.UpdateDriverLocation(ctx, ping); err != nil {
 		return fmt.Errorf("spatial update failed: %w", err)
 	}
@@ -59,6 +62,7 @@ func (s *GeoStore) ProcessPing(ctx context.Context, ping *telemetryv1.LocationPi
 		return fmt.Errorf("pubsub fan-out failed: %w", err)
 	}
 
+	metrics.Default().RedisLatency.Observe(time.Since(start).Seconds())
 	return nil
 }
 

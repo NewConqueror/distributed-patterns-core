@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"geopulse/internal/metrics"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -132,5 +133,6 @@ func (s *Sweeper) SweepOnce(ctx context.Context) (int, error) {
 	}
 
 	s.totalPruned.Add(int64(len(staleIDs)))
+	metrics.Default().RedisPrunedDrivers.Add(float64(len(staleIDs)))
 	return len(staleIDs), nil
 }

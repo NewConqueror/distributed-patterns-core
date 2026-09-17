@@ -9,6 +9,7 @@ import (
 
 	telemetryv1 "geopulse/gen/go/telemetry/v1"
 	"geopulse/internal/buffer"
+	"geopulse/internal/metrics"
 )
 
 // SpatialQuerier defines the contract for geospatial radius searches.
@@ -93,6 +94,10 @@ func (s *TelemetryServer) StreamLocation(stream telemetryv1.TelemetryService_Str
 	s.metrics.ActiveStreams.Add(1)
 	defer s.metrics.ActiveStreams.Add(-1)
 
+	prom := metrics.Default()
+	prom.ActiveConnections.Inc()
+	defer prom.ActiveConnections.Dec()
+
 	s.logger.Info("gRPC client stream connected", "stream_id", streamID)
 
 	var (
@@ -143,6 +148,7 @@ func (s *TelemetryServer) StreamLocation(stream telemetryv1.TelemetryService_Str
 		}
 
 		s.metrics.TotalReceived.Add(1)
+		prom.LocationPings.WithLabelValues("received").Inc()
 		processedCount++
 
 		// Push to backpressure ring buffer with drop policy
@@ -150,10 +156,15 @@ func (s *TelemetryServer) StreamLocation(stream telemetryv1.TelemetryService_Str
 		if dropped {
 			if droppedOldest {
 				s.metrics.TotalDroppedOldest.Add(1)
+				prom.LocationPings.WithLabelValues("dropped_oldest").Inc()
 			} else {
 				s.metrics.TotalDroppedNewest.Add(1)
+				prom.LocationPings.WithLabelValues("dropped_newest").Inc()
 			}
 		}
+
+		// Update ring buffer depth gauge
+		prom.RingBufferDepth.Set(float64(s.buffer.Stats().CurrentDepth))
 	}
 }
 
