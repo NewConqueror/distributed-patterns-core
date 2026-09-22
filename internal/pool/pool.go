@@ -10,7 +10,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"DistributedFault-Tolerant_TaskOrchestrator/internal/observability"
 	"DistributedFault-Tolerant_TaskOrchestrator/internal/task"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -28,6 +31,8 @@ type Config struct {
 	DefaultTimeout  time.Duration // Timeout for each individual job execution (0 = no timeout)
 	ShutdownTimeout time.Duration // Grace period for workers to finish during shutdown (default: 15s)
 	Logger          *slog.Logger  // Optional logger (default: slog.Default())
+	Metrics         *observability.Metrics
+	Tracer          *observability.TracingManager
 }
 
 // ResultCallback is an optional hook invoked when a job finishes.
@@ -140,6 +145,18 @@ func (p *Pool) workerLoop(workerID int) {
 // Crucially, a panic here only affects this single job; the worker goroutine does not die.
 func (p *Pool) safeProcess(workerID int, job *task.Job) {
 	var jobErr error
+	startTime := time.Now()
+
+	if p.config.Metrics != nil {
+		p.config.Metrics.IncActiveWorkers()
+		p.config.Metrics.SetQueueDepth(float64(len(p.jobs)))
+	}
+
+	execCtx := p.ctx
+	var span trace.Span
+	if p.config.Tracer != nil {
+		execCtx, span = p.config.Tracer.StartJobSpan(execCtx, job, fmt.Sprintf("worker-%d", workerID))
+	}
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -151,6 +168,27 @@ func (p *Pool) safeProcess(workerID int, job *task.Job) {
 			)
 			jobErr = fmt.Errorf("%w: %v", ErrJobPanic, r)
 			p.handleJobFailure(job, jobErr, true)
+		}
+
+		if span != nil {
+			if jobErr != nil {
+				p.config.Tracer.RecordSpanError(span, jobErr)
+			} else {
+				p.config.Tracer.RecordSpanSuccess(span)
+			}
+			span.End()
+		}
+
+		if p.config.Metrics != nil {
+			duration := time.Since(startTime)
+			if jobErr != nil {
+				p.config.Metrics.RecordJobFailed(job.Type, duration)
+				if job.State() == task.StateDLQ {
+					p.config.Metrics.RecordJobDLQ(job.Type)
+				}
+			} else {
+				p.config.Metrics.RecordJobCompleted(job.Type, duration)
+			}
 		}
 
 		if p.onComplete != nil {
@@ -177,10 +215,9 @@ func (p *Pool) safeProcess(workerID int, job *task.Job) {
 	handler := handlerVal.(task.Handler)
 
 	// 3. Prepare Context with timeout if configured
-	execCtx := p.ctx
 	var cancel context.CancelFunc
 	if p.config.DefaultTimeout > 0 {
-		execCtx, cancel = context.WithTimeout(p.ctx, p.config.DefaultTimeout)
+		execCtx, cancel = context.WithTimeout(execCtx, p.config.DefaultTimeout)
 		defer cancel()
 	}
 
@@ -215,6 +252,9 @@ func (p *Pool) handleJobError(job *task.Job, err error) {
 			"job_id", job.ID,
 			"err", err,
 		)
+		if p.config.Metrics != nil {
+			p.config.Metrics.RecordJobDLQ(job.Type)
+		}
 		p.handleJobFailure(job, err, true)
 		return
 	}
@@ -224,6 +264,10 @@ func (p *Pool) handleJobError(job *task.Job, err error) {
 		job.IncrementRetry()
 		_ = job.TransitionTo(task.StateFailed)
 		_ = job.TransitionTo(task.StatePending)
+
+		if p.config.Metrics != nil {
+			p.config.Metrics.RecordJobRetry(job.Type)
+		}
 
 		p.logger.Info("Job failed with retryable error, re-submitting to queue",
 			"job_id", job.ID,
@@ -240,6 +284,9 @@ func (p *Pool) handleJobError(job *task.Job, err error) {
 					"job_id", j.ID,
 					"err", submitErr,
 				)
+				if p.config.Metrics != nil {
+					p.config.Metrics.RecordJobDLQ(j.Type)
+				}
 				p.handleJobFailure(j, submitErr, true)
 			}
 		}(job)
@@ -252,6 +299,9 @@ func (p *Pool) handleJobError(job *task.Job, err error) {
 		"retry_count", job.RetryCount,
 		"err", err,
 	)
+	if p.config.Metrics != nil {
+		p.config.Metrics.RecordJobDLQ(job.Type)
+	}
 	p.handleJobFailure(job, err, true)
 }
 

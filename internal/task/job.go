@@ -60,11 +60,12 @@ type Job struct {
 	ID           string    `json:"id"`
 	Type         string    `json:"type"`
 	Payload      []byte    `json:"payload"`
-	CurrentState State     `json:"current_state"`
-	MaxRetries   int       `json:"max_retries"`
-	RetryCount   int       `json:"retry_count"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	CurrentState State             `json:"current_state"`
+	MaxRetries   int               `json:"max_retries"`
+	RetryCount   int               `json:"retry_count"`
+	Metadata     map[string]string `json:"metadata,omitempty"`
+	CreatedAt    time.Time         `json:"created_at"`
+	UpdatedAt    time.Time         `json:"updated_at"`
 }
 
 // NewJob creates a new Job initialized in the PENDING state.
@@ -77,9 +78,59 @@ func NewJob(id string, jobType string, payload []byte, maxRetries int) *Job {
 		CurrentState: StatePending,
 		MaxRetries:   maxRetries,
 		RetryCount:   0,
+		Metadata:     make(map[string]string),
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
+}
+
+// SetMetadata sets a metadata key-value in a thread-safe manner.
+func (j *Job) SetMetadata(key, value string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.Metadata == nil {
+		j.Metadata = make(map[string]string)
+	}
+	j.Metadata[key] = value
+}
+
+// GetMetadata gets a metadata value in a thread-safe manner.
+func (j *Job) GetMetadata(key string) string {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	if j.Metadata == nil {
+		return ""
+	}
+	return j.Metadata[key]
+}
+
+// Carrier returns a MapCarrier for OpenTelemetry propagation.
+func (j *Job) Carrier() MapCarrier {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.Metadata == nil {
+		j.Metadata = make(map[string]string)
+	}
+	return MapCarrier(j.Metadata)
+}
+
+// MapCarrier adapts map[string]string to OpenTelemetry propagation.TextMapCarrier.
+type MapCarrier map[string]string
+
+func (c MapCarrier) Get(key string) string {
+	return c[key]
+}
+
+func (c MapCarrier) Set(key, val string) {
+	c[key] = val
+}
+
+func (c MapCarrier) Keys() []string {
+	keys := make([]string, 0, len(c))
+	for k := range c {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 // State returns the current state in a thread-safe manner.

@@ -14,9 +14,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
 	"DistributedFault-Tolerant_TaskOrchestrator/internal/distributed"
+	"DistributedFault-Tolerant_TaskOrchestrator/internal/observability"
 	"DistributedFault-Tolerant_TaskOrchestrator/internal/pool"
 	"DistributedFault-Tolerant_TaskOrchestrator/internal/task"
 )
@@ -33,11 +36,54 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
-	logger.Info("Starting Distributed Fault-Tolerant Task Orchestrator")
+	logger.Info("Starting Distributed Fault-Tolerant Task Orchestrator (Phase 3: Observability & Health)")
 
 	// 2. OS Signal Listening using signal.NotifyContext
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// 3. Setup Observability: Prometheus Metrics & OpenTelemetry Tracing
+	promReg := prometheus.DefaultRegisterer.(*prometheus.Registry)
+	metrics := observability.NewMetrics(promReg)
+
+	// Tracing provider
+	tp := sdktrace.NewTracerProvider()
+	defer func() { _ = tp.Shutdown(context.Background()) }()
+	tracingMgr := observability.NewTracingManager(tp)
+
+	// 4. Redis Client Initialization
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = "127.0.0.1:6379"
+	}
+
+	rdb := redis.NewClient(&redis.Options{
+		Addr:            redisAddr,
+		DialTimeout:     1 * time.Second,
+		MaxRetries:      1,
+		DisableIndentity: true,
+	})
+	defer rdb.Close()
+
+	// 5. Start Observability HTTP Server (/metrics, /healthz, /ready)
+	metricsPort := os.Getenv("METRICS_PORT")
+	if metricsPort == "" {
+		metricsPort = "9090"
+	}
+	obsServer := observability.NewServer(observability.ServerConfig{
+		Addr:   ":" + metricsPort,
+		Logger: logger,
+	}, metrics, rdb)
+
+	if err := obsServer.Start(); err != nil {
+		logger.Error("Failed to start observability HTTP server", "err", err)
+	} else {
+		logger.Info("Observability endpoints active",
+			"metrics", fmt.Sprintf("http://localhost:%s/metrics", metricsPort),
+			"healthz", fmt.Sprintf("http://localhost:%s/healthz", metricsPort),
+			"ready", fmt.Sprintf("http://localhost:%s/ready", metricsPort),
+		)
+	}
 
 	// Statistics counters
 	var (
@@ -57,40 +103,30 @@ func main() {
 		}
 	}
 
-	// 3. Local Worker Pool Initialization (Phase 1 Engine)
+	// 6. Local Worker Pool Initialization (with Metrics & Tracing instrumentation)
 	poolCfg := pool.Config{
 		WorkersCount:    runtime.NumCPU(),
 		QueueCapacity:   50,
 		DefaultTimeout:  5 * time.Second,
 		ShutdownTimeout: 15 * time.Second,
 		Logger:          logger,
+		Metrics:         metrics,
+		Tracer:          tracingMgr,
 	}
 	workerPool := pool.NewPool(poolCfg, onComplete)
 	registerHandlers(workerPool, logger)
 	workerPool.Start()
 
-	// 4. Redis Connection Check for Phase 2 Distributed Mode
-	redisAddr := os.Getenv("REDIS_ADDR")
-	if redisAddr == "" {
-		redisAddr = "127.0.0.1:6379"
-	}
-
-	rdb := redis.NewClient(&redis.Options{
-		Addr:            redisAddr,
-		DialTimeout:     1 * time.Second,
-		MaxRetries:      1,
-		DisableIndentity: true,
-	})
-
+	// 7. Redis Connection Check for Phase 2 Distributed Mode
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 1*time.Second)
-	err := rdb.Ping(pingCtx).Err()
+	pingErr := rdb.Ping(pingCtx).Err()
 	pingCancel()
 
 	var workerNode *distributed.WorkerNode
 	var distQueue *distributed.Queue
 
-	if err == nil {
-		logger.Info("Successfully connected to Redis! Initializing Phase 2 Distributed Mode", "addr", redisAddr)
+	if pingErr == nil {
+		logger.Info("Connected to Redis! Running in Phase 2 Distributed Cluster Mode", "addr", redisAddr)
 
 		distCfg := distributed.DefaultConfig()
 		distCfg.Logger = logger
@@ -105,17 +141,18 @@ func main() {
 			defer workerNode.Stop()
 		}
 	} else {
-		logger.Warn("Redis not detected. Running in Phase 1 Local In-Memory Mode (Start Redis on 127.0.0.1:6379 to enable Phase 2)",
+		logger.Warn("Redis not detected. Running in Phase 1 In-Memory Mode (Start Redis on 127.0.0.1:6379 to activate Phase 2)",
 			"redis_addr", redisAddr,
-			"ping_err", err,
+			"ping_err", pingErr,
 		)
 	}
 
-	// 5. Simulate Incoming Jobs in a separate goroutine
+	// 8. Simulate Incoming Jobs with Distributed Tracing (Producer Trace Context Propagation)
 	producerDone := make(chan struct{})
 	go func() {
 		defer close(producerDone)
 		jobTypes := []string{"email", "temporary_fail", "fatal_corrupt", "panic_task", "quick_calc"}
+		producerTracer := tp.Tracer("job-producer")
 
 		for i := 1; ; i++ {
 			select {
@@ -136,6 +173,11 @@ func main() {
 
 				newJob := task.NewJob(jobID, jType, payload, 2)
 
+				// Create Producer Span and inject trace context (TraceID & SpanID) into job.Metadata
+				pCtx, pSpan := producerTracer.Start(ctx, fmt.Sprintf("producer:enqueue:%s", jType))
+				tracingMgr.InjectTraceContext(pCtx, newJob)
+				pSpan.End()
+
 				// If Redis distributed mode is active, publish to Redis Stream (XADD)
 				if workerNode != nil && distQueue != nil {
 					_, enqueueErr := distQueue.Enqueue(ctx, newJob)
@@ -143,7 +185,7 @@ func main() {
 						logger.Error("Failed to enqueue job to Redis Stream", "job_id", jobID, "err", enqueueErr)
 					}
 				} else {
-					// Otherwise, submit directly to local in-memory pool
+					// Otherwise, submit directly to local worker pool
 					submitCtx, submitCancel := context.WithTimeout(ctx, 500*time.Millisecond)
 					submitErr := workerPool.SubmitWithTimeout(submitCtx, newJob)
 					submitCancel()
@@ -162,7 +204,7 @@ func main() {
 		}
 	}()
 
-	// 6. Wait for OS termination signal
+	// 9. Wait for OS termination signal
 	logger.Info("Application is running. Press Ctrl+C or send SIGTERM to trigger graceful shutdown.")
 	<-ctx.Done()
 
@@ -172,12 +214,12 @@ func main() {
 	// Wait for producer to stop
 	<-producerDone
 
-	// 7. Stop Distributed WorkerNode if active
+	// 10. Stop Distributed WorkerNode if active
 	if workerNode != nil {
 		workerNode.Stop()
 	}
 
-	// 8. Gracefully Drain In-Memory Worker Pool
+	// 11. Gracefully Drain In-Memory Worker Pool
 	shutdownStart := time.Now()
 	if err := workerPool.Shutdown(15 * time.Second); err != nil {
 		logger.Error("Graceful shutdown encountered an issue", "err", err)
@@ -185,7 +227,14 @@ func main() {
 		logger.Info("Worker pool gracefully drained all active and queued jobs", "duration", time.Since(shutdownStart))
 	}
 
-	// 9. Report Final Stats
+	// 12. Shutdown Observability HTTP Server
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer shutdownCancel()
+	if err := obsServer.Shutdown(shutdownCtx); err != nil {
+		logger.Error("Observability server shutdown error", "err", err)
+	}
+
+	// 13. Report Final Stats
 	logger.Info("--- Final Orchestrator Statistics ---",
 		"completed", completedCount.Load(),
 		"retried_failed", failedCount.Load(),
