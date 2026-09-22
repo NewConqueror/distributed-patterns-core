@@ -1,0 +1,101 @@
+version: '3.8'
+
+services:
+  # 1. Distributed Storage: Redis
+  redis:
+    image: redis:7-alpine
+    container_name: orchestrator-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+    networks:
+      - orchestrator-net
+
+  # 2. Worker Node 1
+  worker-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: orchestrator-worker-1
+    environment:
+      - REDIS_ADDR=redis:6379
+      - METRICS_PORT=9091
+    ports:
+      - "9091:9091"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - orchestrator-net
+    restart: unless-stopped
+
+  # 3. Worker Node 2 (Multi-node cluster failover)
+  worker-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: orchestrator-worker-2
+    environment:
+      - REDIS_ADDR=redis:6379
+      - METRICS_PORT=9092
+    ports:
+      - "9092:9092"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - orchestrator-net
+    restart: unless-stopped
+
+  # 4. Metrics & Alerting: Prometheus
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: orchestrator-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deployments/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deployments/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    networks:
+      - orchestrator-net
+
+  # 5. Visualization: Grafana
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: orchestrator-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./deployments/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    networks:
+      - orchestrator-net
+
+  # 6. Distributed Tracing: Jaeger
+  jaeger:
+    image: jaegertracing/all-in-one:1.55
+    container_name: orchestrator-jaeger
+    ports:
+      - "16686:16686" # Web UI
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    networks:
+      - orchestrator-net
+
+networks:
+  orchestrator-net:
+    driver: bridge

@@ -113,8 +113,12 @@ func (r *Reaper) ScanAndClaim(ctx context.Context) {
 		if jobID != "" {
 			held, _, lockErr := r.leaseMgr.IsLockHeld(ctx, jobID)
 			if lockErr == nil && !held {
-				// Lock is gone! If it's been idle at least 3 seconds, it's considered orphaned
-				if pending.Idle >= 3*time.Second {
+				// Lock is gone! If it's been idle at least HeartbeatInterval, it's considered orphaned
+				minWait := r.cfg.HeartbeatInterval
+				if minWait <= 0 {
+					minWait = 500 * time.Millisecond
+				}
+				if pending.Idle >= minWait {
 					isLockMissing = true
 				}
 			}
