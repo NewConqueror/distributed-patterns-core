@@ -14,6 +14,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
+	"DistributedFault-Tolerant_TaskOrchestrator/internal/distributed"
 	"DistributedFault-Tolerant_TaskOrchestrator/internal/pool"
 	"DistributedFault-Tolerant_TaskOrchestrator/internal/task"
 )
@@ -30,10 +33,9 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
-	logger.Info("Starting Distributed Fault-Tolerant Task Orchestrator (Phase 1: In-Memory Concurrency)")
+	logger.Info("Starting Distributed Fault-Tolerant Task Orchestrator")
 
 	// 2. OS Signal Listening using signal.NotifyContext
-	// Catches SIGINT (Ctrl+C) and SIGTERM (Kill)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -44,7 +46,6 @@ func main() {
 		dlqCount       atomic.Int64
 	)
 
-	// Callback hook to monitor job outcomes
 	onComplete := func(job *task.Job, err error) {
 		switch job.State() {
 		case task.StateCompleted:
@@ -56,23 +57,61 @@ func main() {
 		}
 	}
 
-	// 3. Worker Pool Configuration & Initialization
-	cfg := pool.Config{
+	// 3. Local Worker Pool Initialization (Phase 1 Engine)
+	poolCfg := pool.Config{
 		WorkersCount:    runtime.NumCPU(),
 		QueueCapacity:   50,
 		DefaultTimeout:  5 * time.Second,
 		ShutdownTimeout: 15 * time.Second,
 		Logger:          logger,
 	}
-	workerPool := pool.NewPool(cfg, onComplete)
-
-	// 4. Register Task Handlers for different job types
+	workerPool := pool.NewPool(poolCfg, onComplete)
 	registerHandlers(workerPool, logger)
-
-	// 5. Start Worker Pool
 	workerPool.Start()
 
-	// 6. Simulate Incoming Jobs in a separate goroutine
+	// 4. Redis Connection Check for Phase 2 Distributed Mode
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = "127.0.0.1:6379"
+	}
+
+	rdb := redis.NewClient(&redis.Options{
+		Addr:            redisAddr,
+		DialTimeout:     1 * time.Second,
+		MaxRetries:      1,
+		DisableIndentity: true,
+	})
+
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 1*time.Second)
+	err := rdb.Ping(pingCtx).Err()
+	pingCancel()
+
+	var workerNode *distributed.WorkerNode
+	var distQueue *distributed.Queue
+
+	if err == nil {
+		logger.Info("Successfully connected to Redis! Initializing Phase 2 Distributed Mode", "addr", redisAddr)
+
+		distCfg := distributed.DefaultConfig()
+		distCfg.Logger = logger
+
+		nodeID := fmt.Sprintf("worker-node-%d-%d", os.Getpid(), rand.Intn(1000))
+		distQueue = distributed.NewQueue(rdb, distCfg)
+		workerNode = distributed.NewWorkerNode(rdb, distCfg, nodeID, workerPool)
+
+		if startErr := workerNode.Start(); startErr != nil {
+			logger.Error("Failed to start distributed WorkerNode, continuing in local mode", "err", startErr)
+		} else {
+			defer workerNode.Stop()
+		}
+	} else {
+		logger.Warn("Redis not detected. Running in Phase 1 Local In-Memory Mode (Start Redis on 127.0.0.1:6379 to enable Phase 2)",
+			"redis_addr", redisAddr,
+			"ping_err", err,
+		)
+	}
+
+	// 5. Simulate Incoming Jobs in a separate goroutine
 	producerDone := make(chan struct{})
 	go func() {
 		defer close(producerDone)
@@ -91,42 +130,54 @@ func main() {
 				if jType == "email" {
 					payload, _ = json.Marshal(EmailPayload{
 						Recipient: fmt.Sprintf("user%d@example.com", i),
-						Subject:   "Task Processed Notification",
+						Subject:   "Task Notification",
 					})
 				}
 
-				maxRetries := 2
-				newJob := task.NewJob(jobID, jType, payload, maxRetries)
+				newJob := task.NewJob(jobID, jType, payload, 2)
 
-				// Backpressure submission
-				submitCtx, submitCancel := context.WithTimeout(ctx, 500*time.Millisecond)
-				err := workerPool.SubmitWithTimeout(submitCtx, newJob)
-				submitCancel()
+				// If Redis distributed mode is active, publish to Redis Stream (XADD)
+				if workerNode != nil && distQueue != nil {
+					_, enqueueErr := distQueue.Enqueue(ctx, newJob)
+					if enqueueErr != nil && !errors.Is(enqueueErr, context.Canceled) {
+						logger.Error("Failed to enqueue job to Redis Stream", "job_id", jobID, "err", enqueueErr)
+					}
+				} else {
+					// Otherwise, submit directly to local in-memory pool
+					submitCtx, submitCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+					submitErr := workerPool.SubmitWithTimeout(submitCtx, newJob)
+					submitCancel()
 
-				if err != nil {
-					if errors.Is(err, pool.ErrQueueFull) {
-						logger.Warn("Queue is saturated, applying backpressure", "job_id", jobID)
-					} else if errors.Is(err, context.Canceled) || errors.Is(err, pool.ErrPoolClosed) {
-						return
+					if submitErr != nil {
+						if errors.Is(submitErr, pool.ErrQueueFull) {
+							logger.Warn("Local queue saturated, applying backpressure", "job_id", jobID)
+						} else if errors.Is(submitErr, context.Canceled) || errors.Is(submitErr, pool.ErrPoolClosed) {
+							return
+						}
 					}
 				}
 
-				time.Sleep(150 * time.Millisecond)
+				time.Sleep(200 * time.Millisecond)
 			}
 		}
 	}()
 
-	// 7. Wait for OS termination signal
+	// 6. Wait for OS termination signal
 	logger.Info("Application is running. Press Ctrl+C or send SIGTERM to trigger graceful shutdown.")
 	<-ctx.Done()
 
 	logger.Info("Shutdown signal received! Beginning graceful shutdown cascade...")
-	stop() // Stop catching further signals to allow forced termination on repeated Ctrl+C
+	stop()
 
-	// Wait for producer to stop dispatching
+	// Wait for producer to stop
 	<-producerDone
 
-	// 8. Graceful Shutdown of Worker Pool (wait up to 15s for active jobs)
+	// 7. Stop Distributed WorkerNode if active
+	if workerNode != nil {
+		workerNode.Stop()
+	}
+
+	// 8. Gracefully Drain In-Memory Worker Pool
 	shutdownStart := time.Now()
 	if err := workerPool.Shutdown(15 * time.Second); err != nil {
 		logger.Error("Graceful shutdown encountered an issue", "err", err)
@@ -143,7 +194,6 @@ func main() {
 }
 
 func registerHandlers(p *pool.Pool, logger *slog.Logger) {
-	// Standard success job
 	p.RegisterHandler("email", task.HandlerFunc(func(ctx context.Context, job task.Job) error {
 		select {
 		case <-time.After(100 * time.Millisecond):
@@ -153,7 +203,6 @@ func registerHandlers(p *pool.Pool, logger *slog.Logger) {
 		}
 	}))
 
-	// Simple calculation job
 	p.RegisterHandler("quick_calc", task.HandlerFunc(func(ctx context.Context, job task.Job) error {
 		select {
 		case <-time.After(50 * time.Millisecond):
@@ -163,7 +212,6 @@ func registerHandlers(p *pool.Pool, logger *slog.Logger) {
 		}
 	}))
 
-	// Flaky job: fails with TemporaryError
 	p.RegisterHandler("temporary_fail", task.HandlerFunc(func(ctx context.Context, job task.Job) error {
 		select {
 		case <-time.After(80 * time.Millisecond):
@@ -173,12 +221,10 @@ func registerHandlers(p *pool.Pool, logger *slog.Logger) {
 		}
 	}))
 
-	// Fatal error job: should never retry, immediately routes to DLQ
 	p.RegisterHandler("fatal_corrupt", task.HandlerFunc(func(ctx context.Context, job task.Job) error {
 		return task.NewFatalError(errors.New("unrecoverable schema deserialization failure"))
 	}))
 
-	// Panicking job: triggers recover() in worker, worker survives
 	p.RegisterHandler("panic_task", task.HandlerFunc(func(ctx context.Context, job task.Job) error {
 		panic("unexpected nil pointer dereference simulation")
 	}))

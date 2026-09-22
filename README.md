@@ -1,8 +1,12 @@
 # Distributed Fault-Tolerant Task Orchestrator
 
+Production-grade, distributed, fault-tolerant asynchronous task orchestration engine written in Go.
+
+---
+
 ## Faz 1: Çekirdek Concurrency ve Yerel Worker Pool
 
-Bu fazın amacı, hiçbir dış ağ bağımlılığı (Redis, DB vb.) olmadan, tek bir binary içinde bellek ve goroutine yönetimini hatasız, güvenli ve dayanıklı bir şekilde kurmaktır.
+Tek bir binary içinde harici bağımlılık olmadan bellek ve thread yönetimini kurar.
 
 ```
 +-------------------------------------------------------------+
@@ -14,39 +18,63 @@ Bu fazın amacı, hiçbir dış ağ bağımlılığı (Redis, DB vb.) olmadan, t
 +-------------------------------------------------------------+
 ```
 
+- **State Machine**: `PENDING -> RUNNING -> COMPLETED / FAILED -> DLQ` durum geçiş kontrolü (`ValidateTransition`).
+- **Worker Pool**: `runtime.NumCPU()` adet worker goroutine, buffered kanal ve backpressure koruması.
+- **Panic Recovery**: Worker başına bağımsız `defer / recover()`, handler çökse dahi worker goroutine canlı kalır.
+- **Error Classification**: `TemporaryError` (yeniden denenebilir) ve `FatalError` (doğrudan DLQ) ayrımı.
+- **Graceful Shutdown**: `signal.NotifyContext` ile OS sinyallerini yakalama ve `sync.WaitGroup` ile kademeli tahliye.
+
+---
+
+## Faz 2: Dağıtık Hata Toleransı, Heartbeat ve Kuyruk (Redis Streams)
+
+Sistemi çok düğümlü (multi-node) hale getirir; iş kaybını, düğüm çökmelerini ve ağ gecikmelerini dağıtık olarak yönetir.
+
+```
+[Producer] ---> (Redis Stream: tasks:stream)
+                     │
+         XREADGROUP (Pending List - PEL)
+                     │
+                     ▼
+              [Worker Node] ──(Heartbeat Loop)──> [Redis Lock: job:lock:{id}]
+                     │ (Crash / Timeout)
+                     ▼
+          [Claimer/Reaper Goroutine] (XCLAIM)
+```
+
 ### Proje Mimarisi
 
-- `internal/task/job.go`: 
-  - `Job` veri yapısı (`ID`, `Type`, `Payload`, `CurrentState`, `MaxRetries`, `RetryCount`, `CreatedAt`, `UpdatedAt`).
-  - `State` Enum: `PENDING`, `RUNNING`, `COMPLETED`, `FAILED`, `DLQ`.
-  - State Machine Doğrulaması: `ValidateTransition` & `TransitionTo` kuralları.
-  - `Handler` arayüzü ve `HandlerFunc` adaptörü.
-- `internal/task/errors.go`:
-  - `TemporaryError`: Yeniden denenebilir (retryable) geçici hatalar.
-  - `FatalError`: Yeniden denenemez, doğrudan DLQ'ya gönderilen kritik veri hataları.
-  - `IsTemporary` ve `IsFatal` tip sorgulama fonksiyonları.
-- `internal/pool/pool.go`:
-  - Sabit boyutlu worker goroutine yönetimi (`runtime.NumCPU()`).
-  - Buffered kanal ile iş kuyruğu (`chan *task.Job`).
-  - Kanal tıkanma koruması (Backpressure & `ErrQueueFull`).
-  - Her iş için bağımsız `defer / recover()` ile Panic Recovery (worker'lar çökmez).
-  - Hata sınıflandırmasına göre otomatik yeniden deneme (`MaxRetries`) veya DLQ'ya yönlendirme.
-  - Kademeli Graceful Shutdown (`ShutdownTimeout`, `sync.WaitGroup`, `context.DeadlineExceeded`).
+- `internal/task/`:
+  - `job.go`: `Job` modeli, durum kuralları ve `Handler` arayüzü.
+  - `errors.go`: `TemporaryError`, `FatalError`, `IsTemporary`, `IsFatal`.
+- `internal/pool/`:
+  - `pool.go`: Sabit boyutlu worker havuzu, panic koruması, graceful shutdown.
+- `internal/distributed/`:
+  - `queue.go`: Redis Streams entegrasyonu, `XGroupCreateMkStream`, `XADD`, `XACK`, `EnqueueDLQ`.
+  - `heartbeat.go`: `LeaseManager` ile dağıtık kilit edinme (`SET NX EX`), Lua tabanlı güvenli `ReleaseLock` ve periyodik `StartHeartbeat` TTL yenileme döngüsü.
+  - `retry.go`: `RetryManager` ile $WaitTime = Base \times 2^{RetryCount} + RandomJitter$ formülü, gecikmeli işlerin Redis Sorted Set (`tasks:delayed`) üzerinde tutulması ve Lua script ile atomik olarak ana akışa yeniden enjekte eden scheduler poller.
+  - `reaper.go`: `Reaper` goroutine ile PEL (`XPENDING`) taraması, kilit düşmesi veya idle time aşımı durumunda yetim (orphan) işlerin `XCLAIM` ile canlı düğümlere devredilmesi.
+  - `consumer.go`: `WorkerNode` ile Redis Stream (`XREADGROUP`), yerel Worker Pool, Lease/Heartbeat ve Ack/Retry/DLQ orkestrasyonu.
 - `cmd/server/main.go`:
-  - `signal.NotifyContext` ile `SIGINT` (Ctrl+C) ve `SIGTERM` sinyallerini yakalama.
-  - Gerçek zamanlı örnek görev üreticisi ve simülasyonu.
+  - Hibrit çalışma modu: Redis varsa tam dağıtık çok düğümlü modda, yoksa izole yerel worker modunda çalışır.
+
+---
 
 ### Testleri Çalıştırma
 
-Tüm testleri race condition detector (`-race`) ile çalıştırmak için:
+Tüm birim ve entegrasyon testlerini race condition detector (`-race`) ile çalıştırmak için:
 
 ```bash
-go test -v -race ./...
+go test -count=1 -v -race ./...
 ```
 
 ### Sunucuyu Başlatma
 
 ```bash
+# Yerel In-Memory Modda:
 go run ./cmd/server/main.go
+
+# Dağıtık Redis Modunda (Redis açıkken):
+REDIS_ADDR="127.0.0.1:6379" go run ./cmd/server/main.go
 ```
 Durdurmak için `Ctrl+C` basarak Graceful Shutdown sürecini tetikleyebilirsiniz.
