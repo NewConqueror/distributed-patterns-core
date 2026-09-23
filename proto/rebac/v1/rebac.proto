@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package rebac.v1;
+
+option go_package = "Multi-TenantCoreEngine_with_PostgreSQLRLS_Relation-BasedAccessControlReBAC/proto/rebac/v1;rebacv1";
+
+// AuthorizationService provides Zanzibar ReBAC access check operations.
+service AuthorizationService {
+  // Check evaluates whether a subject has a specific permission/relation on an object.
+  rpc Check(CheckRequest) returns (CheckResponse);
+}
+
+message CheckRequest {
+  string tenant_id = 1;
+  string subject = 2;    // e.g. "user:123" or "workspace:ws-1#member"
+  string permission = 3; // e.g. "viewer", "editor", "owner"
+  string object = 4;     // e.g. "document:doc-456" or "folder:f-1"
+}
+
+message CheckResponse {
+  bool allowed = 1;
+}

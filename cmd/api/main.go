@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,6 +16,11 @@ import (
 	"Multi-TenantCoreEngine_with_PostgreSQLRLS_Relation-BasedAccessControlReBAC/internal/document"
 	"Multi-TenantCoreEngine_with_PostgreSQLRLS_Relation-BasedAccessControlReBAC/internal/http/handler"
 	"Multi-TenantCoreEngine_with_PostgreSQLRLS_Relation-BasedAccessControlReBAC/internal/http/middleware"
+	"Multi-TenantCoreEngine_with_PostgreSQLRLS_Relation-BasedAccessControlReBAC/internal/rebac/engine"
+	rebacgrpc "Multi-TenantCoreEngine_with_PostgreSQLRLS_Relation-BasedAccessControlReBAC/internal/rebac/grpc"
+	rebacv1 "Multi-TenantCoreEngine_with_PostgreSQLRLS_Relation-BasedAccessControlReBAC/proto/rebac/v1"
+
+	"google.golang.org/grpc"
 )
 
 func main() {
@@ -49,12 +55,13 @@ func main() {
 	defer pool.Close()
 	log.Println("Database connection pool established successfully.")
 
+	// 1. Initialize HTTP Layer
 	docRepo := document.NewRepository()
 	docHandler := handler.NewDocumentHandler(pool, docRepo)
 
 	mux := http.NewServeMux()
 
-	// Protected routes wrapped in TenantGuardMiddleware
+	// Protected HTTP routes wrapped in TenantGuardMiddleware
 	protectedMux := http.NewServeMux()
 	protectedMux.HandleFunc("POST /documents", docHandler.Create)
 	protectedMux.HandleFunc("GET /documents", docHandler.List)
@@ -73,7 +80,7 @@ func main() {
 		httpPort = "8080"
 	}
 
-	server := &http.Server{
+	httpServer := &http.Server{
 		Addr:         ":" + httpPort,
 		Handler:      mux,
 		ReadTimeout:  10 * time.Second,
@@ -81,20 +88,46 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("HTTP Server listening on port %s...", httpPort)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Printf("HTTP REST Server listening on port %s...", httpPort)
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("HTTP server error: %v", err)
 		}
 	}()
 
+	// 2. Initialize gRPC ReBAC Check Service
+	grpcPort := os.Getenv("GRPC_PORT")
+	if grpcPort == "" {
+		grpcPort = "50051"
+	}
+
+	grpcListener, err := net.Listen("tcp", ":"+grpcPort)
+	if err != nil {
+		log.Fatalf("Failed to listen on gRPC port %s: %v", grpcPort, err)
+	}
+
+	grpcServer := grpc.NewServer()
+	rebacCheckEngine := engine.NewSQLCheckEngine()
+	rebacService := rebacgrpc.NewServer(pool, rebacCheckEngine)
+	rebacv1.RegisterAuthorizationServiceServer(grpcServer, rebacService)
+
+	go func() {
+		log.Printf("gRPC ReBAC Check Server listening on port %s...", grpcPort)
+		if err := grpcServer.Serve(grpcListener); err != nil {
+			log.Fatalf("gRPC server error: %v", err)
+		}
+	}()
+
+	// 3. Graceful Shutdown
 	<-ctx.Done()
-	log.Println("Shutting down server gracefully...")
+	log.Println("Shutting down servers gracefully...")
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Fatalf("Server shutdown failed: %v", err)
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("HTTP server shutdown error: %v", err)
 	}
-	log.Println("Server gracefully stopped.")
+	grpcServer.GracefulStop()
+
+	log.Println("All servers gracefully stopped.")
 }

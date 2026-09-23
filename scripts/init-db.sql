@@ -9,8 +9,9 @@ BEGIN
 END
 $$;
 
--- Apply initial schema
+-- Apply migrations
 \i /docker-entrypoint-initdb.d/migrations/000001_init_schema.up.sql
+\i /docker-entrypoint-initdb.d/migrations/000002_create_tuples.up.sql
 
 -- Grant permissions to app_user (non-superuser subject to RLS)
 GRANT USAGE ON SCHEMA public TO app_user;
