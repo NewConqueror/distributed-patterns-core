@@ -16,6 +16,7 @@ import (
 	"Multi-TenantCoreEngine_with_PostgreSQLRLS_Relation-BasedAccessControlReBAC/internal/document"
 	"Multi-TenantCoreEngine_with_PostgreSQLRLS_Relation-BasedAccessControlReBAC/internal/http/handler"
 	"Multi-TenantCoreEngine_with_PostgreSQLRLS_Relation-BasedAccessControlReBAC/internal/http/middleware"
+	"Multi-TenantCoreEngine_with_PostgreSQLRLS_Relation-BasedAccessControlReBAC/internal/rebac/cache"
 	"Multi-TenantCoreEngine_with_PostgreSQLRLS_Relation-BasedAccessControlReBAC/internal/rebac/engine"
 	rebacgrpc "Multi-TenantCoreEngine_with_PostgreSQLRLS_Relation-BasedAccessControlReBAC/internal/rebac/grpc"
 	rebacv1 "Multi-TenantCoreEngine_with_PostgreSQLRLS_Relation-BasedAccessControlReBAC/proto/rebac/v1"
@@ -27,8 +28,8 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// 1. PostgreSQL Connection Pool
 	cfg := database.DefaultConfig()
-
 	if host := os.Getenv("DB_HOST"); host != "" {
 		cfg.Host = host
 	}
@@ -55,7 +56,33 @@ func main() {
 	defer pool.Close()
 	log.Println("Database connection pool established successfully.")
 
-	// 1. Initialize HTTP Layer
+	// 2. Multi-Tier Cache Layer (L1 In-Memory + L2 Distributed Redis)
+	l1Cache, err := cache.NewL1Cache(10000)
+	if err != nil {
+		log.Fatalf("Failed to initialize L1 in-memory cache: %v", err)
+	}
+
+	redisCfg := cache.DefaultRedisConfig()
+	var l2Cache *cache.L2Cache
+	redisClient, err := cache.NewRedisClient(ctx, redisCfg)
+	if err != nil {
+		log.Printf("[WARN] Redis not reachable (%v). Continuing with L1 in-memory cache only.", err)
+	} else {
+		defer redisClient.Close()
+		l2Cache = cache.NewL2Cache(redisClient)
+		log.Printf("Connected to Redis at %s:%d (DB: %d).", redisCfg.Host, redisCfg.Port, redisCfg.DB)
+
+		// Start Pub/Sub Invalidation Subscriber
+		invalidationBus := cache.NewInvalidationBus(redisClient, l1Cache, l2Cache)
+		invalidationBus.StartSubscriber(ctx)
+		log.Println("Redis Invalidation Bus subscriber started.")
+	}
+
+	multiTierCache := cache.NewMultiTierCache(l1Cache, l2Cache)
+	rawCheckEngine := engine.NewSQLCheckEngine()
+	cachedCheckEngine := cache.NewCachedCheckEngine(rawCheckEngine, multiTierCache)
+
+	// 3. Initialize HTTP Layer
 	docRepo := document.NewRepository()
 	docHandler := handler.NewDocumentHandler(pool, docRepo)
 
@@ -94,7 +121,7 @@ func main() {
 		}
 	}()
 
-	// 2. Initialize gRPC ReBAC Check Service
+	// 4. Initialize gRPC ReBAC Check Service with Cached Engine
 	grpcPort := os.Getenv("GRPC_PORT")
 	if grpcPort == "" {
 		grpcPort = "50051"
@@ -106,18 +133,17 @@ func main() {
 	}
 
 	grpcServer := grpc.NewServer()
-	rebacCheckEngine := engine.NewSQLCheckEngine()
-	rebacService := rebacgrpc.NewServer(pool, rebacCheckEngine)
+	rebacService := rebacgrpc.NewServer(pool, cachedCheckEngine)
 	rebacv1.RegisterAuthorizationServiceServer(grpcServer, rebacService)
 
 	go func() {
-		log.Printf("gRPC ReBAC Check Server listening on port %s...", grpcPort)
+		log.Printf("gRPC ReBAC Check Server (Multi-Tier Cached) listening on port %s...", grpcPort)
 		if err := grpcServer.Serve(grpcListener); err != nil {
 			log.Fatalf("gRPC server error: %v", err)
 		}
 	}()
 
-	// 3. Graceful Shutdown
+	// 5. Graceful Shutdown
 	<-ctx.Done()
 	log.Println("Shutting down servers gracefully...")
 
