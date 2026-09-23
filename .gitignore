@@ -1,0 +1,22 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/api
+/seed
+
+# Environment files
+.env
+
+# Logs and scratch
+*.log
+scratch/
+test/load/seed_summary.json
+
+# OS files
+.DS_Store

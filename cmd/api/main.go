@@ -85,16 +85,21 @@ func main() {
 	// 3. Initialize HTTP Layer
 	docRepo := document.NewRepository()
 	docHandler := handler.NewDocumentHandler(pool, docRepo)
+	rebacHandler := handler.NewReBACHandler(pool, cachedCheckEngine, rawCheckEngine)
 
 	mux := http.NewServeMux()
 
-	// Protected HTTP routes wrapped in TenantGuardMiddleware
+	// Protected document routes wrapped in TenantGuardMiddleware
 	protectedMux := http.NewServeMux()
 	protectedMux.HandleFunc("POST /documents", docHandler.Create)
 	protectedMux.HandleFunc("GET /documents", docHandler.List)
 	protectedMux.HandleFunc("GET /documents/{id}", docHandler.GetByID)
 
-	mux.Handle("/", middleware.TenantGuardMiddleware(protectedMux))
+	mux.Handle("/documents", middleware.TenantGuardMiddleware(protectedMux))
+	mux.Handle("/documents/", middleware.TenantGuardMiddleware(protectedMux))
+
+	// ReBAC HTTP Check endpoint (supports warm cache & cold cache bypass)
+	mux.HandleFunc("POST /rebac/check", rebacHandler.Check)
 
 	// Health endpoint (unprotected)
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
