@@ -15,16 +15,22 @@ import (
 	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/domain"
 	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/infrastructure/db"
 	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/infrastructure/repository"
+	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/observability"
 	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/usecase"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 type Server struct {
 	pool    *pgxpool.Pool
 	service *usecase.LedgerService
 	repo    *repository.PostgresLedgerRepository
+	metrics *observability.Metrics
 }
 
 func main() {
@@ -52,6 +58,33 @@ func main() {
 	}
 	defer pool.Close()
 
+	// 2. OpenTelemetry Dağıtık İzleme (Tracing) Altyapısını Başlat
+	var traceWriter io.Writer = io.Discard
+	if os.Getenv("ENABLE_TRACE_STDOUT") == "true" {
+		traceWriter = os.Stdout
+	}
+	_, traceShutdown, err := observability.InitTracer(ctx, "financial-ledger-server", traceWriter)
+	if err != nil {
+		log.Printf("OpenTelemetry uyarısı: %v", err)
+	} else {
+		defer func() { _ = traceShutdown(context.Background()) }()
+	}
+
+	// 3. Prometheus Metriklerini Başlat
+	metrics := observability.GetMetrics()
+
+	// Arka planda DB bağlantı havuzu durumunu metriklerde güncelle
+	poolTicker := time.NewTicker(1 * time.Second)
+	defer poolTicker.Stop()
+	go func() {
+		for range poolTicker.C {
+			stat := pool.Stat()
+			metrics.DBPoolTotalConns.Set(float64(stat.TotalConns()))
+			metrics.DBPoolAcquiredConns.Set(float64(stat.AcquiredConns()))
+			metrics.DBPoolIdleConns.Set(float64(stat.IdleConns()))
+		}
+	}()
+
 	repo := repository.NewPostgresLedgerRepository(pool)
 	service := usecase.NewLedgerService(repo)
 
@@ -59,9 +92,10 @@ func main() {
 		pool:    pool,
 		service: service,
 		repo:    repo,
+		metrics: metrics,
 	}
 
-	// 2. Yük testi için tohum (seed) hesapları hazırla
+	// 4. Tohum (seed) hesapları hazırla
 	if err := s.seedAccounts(ctx); err != nil {
 		log.Printf("Hesap tohumlama uyarısı: %v", err)
 	}
@@ -70,7 +104,8 @@ func main() {
 	mux.HandleFunc("POST /transactions", s.handleCreateTransaction)
 	mux.HandleFunc("GET /accounts/balance", s.handleGetBalance)
 	mux.HandleFunc("GET /audit", s.handleAudit)
-	mux.HandleFunc("GET /metrics", s.handleMetrics)
+	mux.Handle("GET /metrics", promhttp.Handler())       // Standart Prometheus Scrape Uç Noktası
+	mux.HandleFunc("GET /metrics/pool", s.handleMetrics) // JSON Formatında Havuz Metrikleri
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"UP"}`))
@@ -85,7 +120,7 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("Financial Ledger HTTP Sunucusu :8080 üzerinde dinlemede...")
+		log.Printf("Financial Ledger HTTP Sunucusu :8080 üzerinde dinlemede (Prometheus /metrics aktif)...")
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("HTTP sunucu hatası: %v", err)
 		}
@@ -118,19 +153,31 @@ func (s *Server) seedAccounts(ctx context.Context) error {
 }
 
 func (s *Server) handleCreateTransaction(w http.ResponseWriter, r *http.Request) {
+	// Gelen HTTP başlıklarından Distributed Tracing bağlamını (context) çıkar
+	ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+	ctx, span := observability.Tracer().Start(ctx, "HTTP POST /transactions")
+	defer span.End()
+
 	idempKey := r.Header.Get("Idempotency-Key")
 	if idempKey == "" {
 		idempKey = uuid.NewString()
 	}
 
+	span.SetAttributes(
+		attribute.String("http.method", "POST"),
+		attribute.String("http.route", "/transactions"),
+		attribute.String("idempotency.key", idempKey),
+	)
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		span.RecordError(err)
 		http.Error(w, "Gövde okunamadı", http.StatusBadRequest)
 		return
 	}
 	defer r.Body.Close()
 
-	resp, code, err := s.service.CreateTransactionWithPessimisticLock(r.Context(), idempKey, body)
+	resp, code, err := s.service.CreateTransactionWithPessimisticLock(ctx, idempKey, body)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(code)
@@ -144,14 +191,20 @@ func (s *Server) handleCreateTransaction(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) handleGetBalance(w http.ResponseWriter, r *http.Request) {
+	ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+	ctx, span := observability.Tracer().Start(ctx, "HTTP GET /accounts/balance")
+	defer span.End()
+
 	accID := r.URL.Query().Get("account_id")
 	if accID == "" {
 		http.Error(w, "account_id parametresi gerekli", http.StatusBadRequest)
 		return
 	}
+	span.SetAttributes(attribute.String("account.id", accID))
 
-	bal, err := s.service.GetAccountBalance(r.Context(), accID)
+	bal, err := s.service.GetAccountBalance(ctx, accID)
 	if err != nil {
+		span.RecordError(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -166,8 +219,13 @@ func (s *Server) handleGetBalance(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
-	report, err := s.service.AuditEntireLedger(r.Context())
+	ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+	ctx, span := observability.Tracer().Start(ctx, "HTTP GET /audit")
+	defer span.End()
+
+	report, err := s.service.AuditEntireLedger(ctx)
 	if err != nil {
+		span.RecordError(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

@@ -12,7 +12,12 @@ import (
 	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/domain"
 	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/idempotency"
 	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/infrastructure/repository"
+	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/observability"
 	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/snapshot"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // EntryDTO, dış dünyadan gelen işlem girdisi formatıdır.
@@ -72,12 +77,40 @@ func (s *LedgerService) SetAuditWorker(w *audit.AuditWorker) {
 
 // AuditAccount, belirli bir hesabın kriptografik hash zincirini denetler.
 func (s *LedgerService) AuditAccount(ctx context.Context, accountID string) (*audit.AuditResult, error) {
-	return s.auditor.AuditAccount(ctx, accountID)
+	ctx, span := observability.Tracer().Start(ctx, "LedgerService.AuditAccount")
+	defer span.End()
+	span.SetAttributes(attribute.String("account.id", accountID))
+
+	res, err := s.auditor.AuditAccount(ctx, accountID)
+	if err != nil {
+		span.RecordError(err)
+		observability.GetMetrics().ReconciliationErrors.WithLabelValues("audit_error").Inc()
+		return nil, err
+	}
+	if res != nil && res.IsTampered {
+		observability.GetMetrics().ReconciliationErrors.WithLabelValues("tampered_hash").Inc()
+	}
+	return res, nil
 }
 
 // AuditEntireLedger, tüm defteri baştan sona tarayarak hash zincirlerini denetler.
 func (s *LedgerService) AuditEntireLedger(ctx context.Context) (*audit.LedgerAuditReport, error) {
-	return s.auditor.AuditEntireLedger(ctx)
+	ctx, span := observability.Tracer().Start(ctx, "LedgerService.AuditEntireLedger")
+	defer span.End()
+
+	report, err := s.auditor.AuditEntireLedger(ctx)
+	if err != nil {
+		span.RecordError(err)
+		observability.GetMetrics().ReconciliationErrors.WithLabelValues("audit_error").Inc()
+		return nil, err
+	}
+
+	if report != nil && !report.IsClean {
+		tamperedCount := len(report.TamperedAccounts)
+		observability.GetMetrics().ReconciliationErrors.WithLabelValues("tampered_hash").Add(float64(tamperedCount))
+		span.SetAttributes(attribute.Int("tampered.count", tamperedCount))
+	}
+	return report, nil
 }
 
 // parseAndValidateRequest, istek gövdesini doğrular ve domain Transaction nesnesini üretir.
@@ -117,14 +150,41 @@ func (s *LedgerService) CreateTransaction(ctx context.Context, idempotencyKey st
 // CreateTransactionWithPessimisticLock, Pessimistic Locking (SELECT ... FOR UPDATE) ile
 // hesapları deterministik sırada kilitleyerek deadlock riski olmadan işlemi yürütür.
 func (s *LedgerService) CreateTransactionWithPessimisticLock(ctx context.Context, idempotencyKey string, rawPayload []byte) (*TransactionResponse, int, error) {
+	ctx, span := observability.Tracer().Start(ctx, "LedgerService.CreateTransactionWithPessimisticLock")
+	defer span.End()
+
+	startTime := time.Now()
+	metrics := observability.GetMetrics()
+	metrics.ActiveTransactions.Inc()
+	defer metrics.ActiveTransactions.Dec()
+
+	span.SetAttributes(
+		attribute.String("idempotency.key", idempotencyKey),
+		attribute.String("concurrency.strategy", "pessimistic"),
+	)
+
 	tx, err := s.parseAndValidateRequest(rawPayload)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		metrics.TransactionDuration.WithLabelValues("422", "pessimistic").Observe(time.Since(startTime).Seconds())
+		metrics.IdempotencyRequests.WithLabelValues("invalid_request").Inc()
 		return nil, 422, err
 	}
+
+	span.SetAttributes(
+		attribute.String("transaction.id", tx.ID()),
+		attribute.String("currency", tx.Currency().Code()),
+		attribute.Int64("amount", tx.TotalAmount().Amount()),
+		attribute.Int("entries.count", len(tx.Entries())),
+	)
 
 	reqHash := idempotency.ComputeRequestHash(rawPayload)
 
 	result, err := s.stateMachine.Process(ctx, idempotencyKey, rawPayload, func(execCtx context.Context) (int, []byte, error) {
+		execCtx, execSpan := observability.Tracer().Start(execCtx, "LedgerService.ExecuteAtomicPessimisticLock")
+		defer execSpan.End()
+
 		resp := TransactionResponse{
 			TransactionID: tx.ID(),
 			Status:        "RESOLVED",
@@ -135,12 +195,14 @@ func (s *LedgerService) CreateTransactionWithPessimisticLock(ctx context.Context
 		}
 		respBytes, err := json.Marshal(resp)
 		if err != nil {
+			execSpan.RecordError(err)
 			return 500, nil, err
 		}
 
 		// Pessimistic kilitleme ve atomik kayıt
 		err = s.repo.ExecuteAtomicLedgerTransactionWithPessimisticLock(execCtx, idempotencyKey, reqHash, tx, 201, respBytes)
 		if err != nil {
+			execSpan.RecordError(err)
 			return 500, nil, fmt.Errorf("pessimistic kayıt hatası: %w", err)
 		}
 
@@ -154,20 +216,49 @@ func (s *LedgerService) CreateTransactionWithPessimisticLock(ctx context.Context
 		return 201, respBytes, nil
 	})
 
-	return s.handleResult(result, err)
+	resp, code, finalErr := s.handleResult(result, err)
+	s.recordObservability(span, metrics, startTime, "pessimistic", resp, code, finalErr)
+	return resp, code, finalErr
 }
 
 // CreateTransactionWithOCC, Optimistic Concurrency Control (OCC) kullanarak işlemi yürütür.
 // Versiyon çakışması (ErrOptimisticLockConflict) olursa üst katmanda Exponential Backoff ile yeniden dener.
 func (s *LedgerService) CreateTransactionWithOCC(ctx context.Context, idempotencyKey string, rawPayload []byte, retryCfg concurrency.RetryConfig) (*TransactionResponse, int, error) {
+	ctx, span := observability.Tracer().Start(ctx, "LedgerService.CreateTransactionWithOCC")
+	defer span.End()
+
+	startTime := time.Now()
+	metrics := observability.GetMetrics()
+	metrics.ActiveTransactions.Inc()
+	defer metrics.ActiveTransactions.Dec()
+
+	span.SetAttributes(
+		attribute.String("idempotency.key", idempotencyKey),
+		attribute.String("concurrency.strategy", "occ"),
+	)
+
 	tx, err := s.parseAndValidateRequest(rawPayload)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		metrics.TransactionDuration.WithLabelValues("422", "occ").Observe(time.Since(startTime).Seconds())
+		metrics.IdempotencyRequests.WithLabelValues("invalid_request").Inc()
 		return nil, 422, err
 	}
+
+	span.SetAttributes(
+		attribute.String("transaction.id", tx.ID()),
+		attribute.String("currency", tx.Currency().Code()),
+		attribute.Int64("amount", tx.TotalAmount().Amount()),
+		attribute.Int("entries.count", len(tx.Entries())),
+	)
 
 	reqHash := idempotency.ComputeRequestHash(rawPayload)
 
 	result, err := s.stateMachine.Process(ctx, idempotencyKey, rawPayload, func(execCtx context.Context) (int, []byte, error) {
+		execCtx, execSpan := observability.Tracer().Start(execCtx, "LedgerService.ExecuteAtomicOCC")
+		defer execSpan.End()
+
 		resp := TransactionResponse{
 			TransactionID: tx.ID(),
 			Status:        "RESOLVED",
@@ -178,6 +269,7 @@ func (s *LedgerService) CreateTransactionWithOCC(ctx context.Context, idempotenc
 		}
 		respBytes, err := json.Marshal(resp)
 		if err != nil {
+			execSpan.RecordError(err)
 			return 500, nil, err
 		}
 
@@ -198,6 +290,7 @@ func (s *LedgerService) CreateTransactionWithOCC(ctx context.Context, idempotenc
 		})
 
 		if retryErr != nil {
+			execSpan.RecordError(retryErr)
 			return 500, nil, retryErr
 		}
 
@@ -211,7 +304,42 @@ func (s *LedgerService) CreateTransactionWithOCC(ctx context.Context, idempotenc
 		return 201, respBytes, nil
 	})
 
-	return s.handleResult(result, err)
+	resp, code, finalErr := s.handleResult(result, err)
+	s.recordObservability(span, metrics, startTime, "occ", resp, code, finalErr)
+	return resp, code, finalErr
+}
+
+func (s *LedgerService) recordObservability(
+	span trace.Span,
+	metrics *observability.Metrics,
+	startTime time.Time,
+	strategy string,
+	resp *TransactionResponse,
+	code int,
+	finalErr error,
+) {
+	if finalErr != nil {
+		span.RecordError(finalErr)
+		span.SetStatus(codes.Error, finalErr.Error())
+		if errors.Is(finalErr, idempotency.ErrIdempotencyKeyReuseWithDifferentPayload) {
+			metrics.IdempotencyRequests.WithLabelValues("key_reuse_error").Inc()
+		} else if errors.Is(finalErr, idempotency.ErrIdempotencyKeyInFlight) {
+			metrics.IdempotencyRequests.WithLabelValues("in_flight").Inc()
+		} else {
+			metrics.IdempotencyRequests.WithLabelValues("error").Inc()
+		}
+	} else {
+		span.SetStatus(codes.Ok, "success")
+		if resp != nil && resp.IsCached {
+			span.SetAttributes(attribute.Bool("idempotency.cache_hit", true))
+			metrics.IdempotencyRequests.WithLabelValues("hit").Inc()
+		} else {
+			span.SetAttributes(attribute.Bool("idempotency.cache_hit", false))
+			metrics.IdempotencyRequests.WithLabelValues("miss").Inc()
+		}
+	}
+
+	metrics.TransactionDuration.WithLabelValues(fmt.Sprintf("%d", code), strategy).Observe(time.Since(startTime).Seconds())
 }
 
 // GetAccountBalance, Snapshotting Engine kullanarak hesabın anlık bakiyesini hızlıca hesaplar.
