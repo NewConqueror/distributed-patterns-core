@@ -1,0 +1,3 @@
+module Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency
+
+go 1.22.2
