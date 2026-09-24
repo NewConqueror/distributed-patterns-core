@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/audit"
 	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/concurrency"
 	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/domain"
 	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/idempotency"
@@ -43,20 +44,39 @@ type LedgerService struct {
 	repo           *repository.PostgresLedgerRepository
 	stateMachine   *idempotency.StateMachine
 	snapshotWorker *snapshot.SnapshotWorker
+	auditor        *audit.Auditor
+	auditWorker    *audit.AuditWorker
 }
 
 // NewLedgerService, yeni bir LedgerService örneği oluşturur.
 func NewLedgerService(repo *repository.PostgresLedgerRepository) *LedgerService {
 	sm := idempotency.NewStateMachine(repo)
+	aud := audit.NewAuditor(repo)
 	return &LedgerService{
 		repo:         repo,
 		stateMachine: sm,
+		auditor:      aud,
 	}
 }
 
 // SetSnapshotWorker, asenkron snapshot pipeline worker'ını servise bağlar.
 func (s *LedgerService) SetSnapshotWorker(w *snapshot.SnapshotWorker) {
 	s.snapshotWorker = w
+}
+
+// SetAuditWorker, periyodik audit worker'ını servise bağlar.
+func (s *LedgerService) SetAuditWorker(w *audit.AuditWorker) {
+	s.auditWorker = w
+}
+
+// AuditAccount, belirli bir hesabın kriptografik hash zincirini denetler.
+func (s *LedgerService) AuditAccount(ctx context.Context, accountID string) (*audit.AuditResult, error) {
+	return s.auditor.AuditAccount(ctx, accountID)
+}
+
+// AuditEntireLedger, tüm defteri baştan sona tarayarak hash zincirlerini denetler.
+func (s *LedgerService) AuditEntireLedger(ctx context.Context) (*audit.LedgerAuditReport, error) {
+	return s.auditor.AuditEntireLedger(ctx)
 }
 
 // parseAndValidateRequest, istek gövdesini doğrular ve domain Transaction nesnesini üretir.

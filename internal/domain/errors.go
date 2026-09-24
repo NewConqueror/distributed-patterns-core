@@ -26,4 +26,7 @@ var (
 
 	// Eşzamanlılık ve Kilitleme Hataları
 	ErrOptimisticLockConflict = errors.New("optimistic lock çakışması: hesap versiyonu değişmiş, işlem yeniden denenmeli")
+
+	// Kriptografik Denetim İzi Hataları
+	ErrDataTampered = errors.New("DataTamperedException: kriptografik denetim izi ihlali tespit edildi, veri manipüle edilmiş")
 )

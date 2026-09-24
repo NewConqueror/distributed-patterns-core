@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/audit"
 	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/domain"
 	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/infrastructure/db"
 	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/infrastructure/repository"
@@ -31,11 +32,13 @@ func getTestPool(t *testing.T) *pgxpool.Pool {
 		}
 	}
 
-	// 1. ve 2. Faz migration şemalarını sırayla yükle
+	// 1, 2 ve 3. Faz migration şemalarını sırayla yükle
 	m1, _ := filepath.Abs("../../../migrations/001_init_schema.sql")
 	_ = db.RunMigrations(context.Background(), pool, m1)
 	m2, _ := filepath.Abs("../../../migrations/002_concurrency_and_snapshots.sql")
 	_ = db.RunMigrations(context.Background(), pool, m2)
+	m3, _ := filepath.Abs("../../../migrations/003_cryptographic_audit_trail.sql")
+	_ = db.RunMigrations(context.Background(), pool, m3)
 
 	return pool
 }
@@ -259,5 +262,47 @@ func TestPostgres_SnapshottingAndFastBalance(t *testing.T) {
 	// 5. Doğrulama: Anlık bakiye 10000 olmalı
 	if fastBalance.Amount() != 10000 {
 		t.Errorf("beklenen bakiye 10000 (6000 snapshot + 4000 delta), alınan: %d", fastBalance.Amount())
+	}
+}
+
+func TestPostgres_CryptographicHashChainAndAudit(t *testing.T) {
+	pool := getTestPool(t)
+	if pool == nil {
+		return
+	}
+	defer pool.Close()
+
+	ctx := context.Background()
+	repo := repository.NewPostgresLedgerRepository(pool)
+	accID, offsetAccID := setupTestAccounts(t, repo)
+
+	// 1. İki işlem kaydet
+	m1 := domain.MustNewMoney(5000, domain.USD)
+	e1, _ := domain.NewEntry("e-audit-1", accID, domain.DirectionDebit, m1)
+	e2, _ := domain.NewEntry("e-audit-2", offsetAccID, domain.DirectionCredit, m1)
+	tx1, _ := domain.NewTransaction("tx-audit-1", time.Now().UTC(), "İşlem 1", []domain.Entry{e1, e2})
+	if err := repo.SaveTransaction(ctx, tx1); err != nil {
+		t.Fatal(err)
+	}
+
+	m2 := domain.MustNewMoney(3000, domain.USD)
+	e3, _ := domain.NewEntry("e-audit-3", accID, domain.DirectionDebit, m2)
+	e4, _ := domain.NewEntry("e-audit-4", offsetAccID, domain.DirectionCredit, m2)
+	tx2, _ := domain.NewTransaction("tx-audit-2", time.Now().UTC(), "İşlem 2", []domain.Entry{e3, e4})
+	if err := repo.SaveTransaction(ctx, tx2); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Hash zincirini doğrula
+	auditor := audit.NewAuditor(repo)
+	res, err := auditor.AuditAccount(ctx, accID)
+	if err != nil {
+		t.Fatalf("denetim başarısız olmamalıydı: %v", err)
+	}
+	if res.IsTampered {
+		t.Fatal("zincir manipüle edilmiş olarak işaretlenmemeli")
+	}
+	if res.TotalEntries != 2 {
+		t.Errorf("2 kayıt denetlenmeliydi, denetlenen: %d", res.TotalEntries)
 	}
 }

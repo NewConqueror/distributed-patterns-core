@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/audit"
 	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/concurrency"
 	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/domain"
 	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/idempotency"
@@ -165,34 +166,106 @@ func (r *PostgresLedgerRepository) SaveTransaction(ctx context.Context, tx domai
 	return nil
 }
 
-// insertTransactionInternal, mevcut bir pgx.Tx içinde işlem ve girdileri ekler.
+// insertTransactionInternal, mevcut bir pgx.Tx içinde işlem ve girdileri kriptografik hash zinciriyle ekler.
 func (r *PostgresLedgerRepository) insertTransactionInternal(ctx context.Context, pgTx pgx.Tx, tx domain.Transaction) error {
+	// 1. Transactions Global Hash Zinciri
+	var lastTxHash string
+	var lastTxSeq int64
+	err := pgTx.QueryRow(ctx, `
+		SELECT current_hash, sequence_num 
+		FROM transactions 
+		ORDER BY sequence_num DESC 
+		LIMIT 1
+	`).Scan(&lastTxHash, &lastTxSeq)
+
+	var prevTxHash string
+	var txSeq int64
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			prevTxHash = audit.ZeroGenesisHash
+			txSeq = 1
+		} else {
+			return fmt.Errorf("önceki işlem hash'i sorgulanamadı: %w", err)
+		}
+	} else {
+		prevTxHash = lastTxHash
+		txSeq = lastTxSeq + 1
+	}
+
+	currTxHash := audit.ComputeHash(prevTxHash, tx.ID(), tx.TotalAmount().Amount(), tx.Timestamp())
+
 	txQuery := `
-		INSERT INTO transactions (id, description, currency, reversal_of_id, created_at)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO transactions (id, description, currency, reversal_of_id, prev_hash, current_hash, sequence_num, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 	`
-	_, err := pgTx.Exec(ctx, txQuery,
+	_, err = pgTx.Exec(ctx, txQuery,
 		tx.ID(),
 		tx.Description(),
 		tx.Currency().Code(),
 		tx.ReversalOfID(),
+		prevTxHash,
+		currTxHash,
+		txSeq,
 		tx.Timestamp(),
 	)
 	if err != nil {
 		return fmt.Errorf("işlem kaydedilemedi: %w", err)
 	}
 
+	// 2. Entries Hesap Bazlı Hash Zinciri
+	accountLastHash := make(map[string]string)
+	accountLastSeq := make(map[string]int64)
+
 	entryQuery := `
-		INSERT INTO entries (id, transaction_id, account_id, direction, amount, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO entries (id, transaction_id, account_id, direction, amount, prev_hash, current_hash, sequence_num, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 	`
 	for _, entry := range tx.Entries() {
-		_, err := pgTx.Exec(ctx, entryQuery,
+		accID := entry.AccountID()
+		prevHash, ok := accountLastHash[accID]
+		var seq int64
+
+		if !ok {
+			var dbHash string
+			var dbSeq int64
+			err := pgTx.QueryRow(ctx, `
+				SELECT current_hash, sequence_num 
+				FROM entries 
+				WHERE account_id = $1 
+				ORDER BY sequence_num DESC 
+				LIMIT 1
+			`, accID).Scan(&dbHash, &dbSeq)
+
+			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					// Genesis Blok: İlk işlemde hesap için tanımlı sabit seed hash kullanılır
+					prevHash = audit.GenesisHash(accID)
+					seq = 1
+				} else {
+					return fmt.Errorf("hesap önceki girdi hash'i sorgulanamadı: %w", err)
+				}
+			} else {
+				prevHash = dbHash
+				seq = dbSeq + 1
+			}
+		} else {
+			seq = accountLastSeq[accID] + 1
+		}
+
+		// Hash_n = SHA256(Hash_{n-1} + TransactionID + Amount + Timestamp)
+		currHash := audit.ComputeHash(prevHash, tx.ID(), entry.Money().Amount(), tx.Timestamp())
+		accountLastHash[accID] = currHash
+		accountLastSeq[accID] = seq
+
+		_, err = pgTx.Exec(ctx, entryQuery,
 			entry.ID(),
 			tx.ID(),
 			entry.AccountID(),
 			string(entry.Direction()),
 			entry.Money().Amount(),
+			prevHash,
+			currHash,
+			seq,
 			tx.Timestamp(),
 		)
 		if err != nil {
@@ -804,4 +877,63 @@ func (r *PostgresLedgerRepository) GetAccountBalanceFast(ctx context.Context, ac
 	}
 
 	return balance, nil
+}
+
+// -----------------------------------------------------------------------------
+// 4.1 & 4.2. Kriptografik Denetim İzi (audit.Storage Arayüzü)
+// -----------------------------------------------------------------------------
+
+// GetChainedEntriesForAccount, bir hesaba ait tüm girdileri sequence_num artan sırada getirir.
+func (r *PostgresLedgerRepository) GetChainedEntriesForAccount(ctx context.Context, accountID string) ([]audit.ChainedRecord, error) {
+	query := `
+		SELECT id, transaction_id, account_id, direction, amount, prev_hash, current_hash, sequence_num, created_at
+		FROM entries
+		WHERE account_id = $1
+		ORDER BY sequence_num ASC
+	`
+	rows, err := r.pool.Query(ctx, query, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("zincir kayıtları sorgulanamadı: %w", err)
+	}
+	defer rows.Close()
+
+	var records []audit.ChainedRecord
+	for rows.Next() {
+		var rec audit.ChainedRecord
+		if err := rows.Scan(
+			&rec.ID,
+			&rec.TransactionID,
+			&rec.AccountID,
+			&rec.Direction,
+			&rec.Amount,
+			&rec.PrevHash,
+			&rec.CurrentHash,
+			&rec.SequenceNum,
+			&rec.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		records = append(records, rec)
+	}
+
+	return records, nil
+}
+
+// ListAccountIDs, sistemdeki tüm hesap kimliklerini döner.
+func (r *PostgresLedgerRepository) ListAccountIDs(ctx context.Context) ([]string, error) {
+	rows, err := r.pool.Query(ctx, "SELECT id FROM accounts ORDER BY created_at ASC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
 }
