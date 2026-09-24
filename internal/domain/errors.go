@@ -23,4 +23,7 @@ var (
 	ErrTransactionAlreadyReversed = errors.New("bu işlem zaten ters kaydedilmiş (reversal yapılmış)")
 	ErrCannotReverseReversal      = errors.New("ters işlem (reversal transaction) tekrar tersine çevrilemez")
 	ErrOriginalTransactionNil     = errors.New("orijinal işlem boş (nil) olamaz")
+
+	// Eşzamanlılık ve Kilitleme Hataları
+	ErrOptimisticLockConflict = errors.New("optimistic lock çakışması: hesap versiyonu değişmiş, işlem yeniden denenmeli")
 )

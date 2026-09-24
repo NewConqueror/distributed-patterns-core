@@ -47,10 +47,16 @@ type Account struct {
 	accountType AccountType
 	currency    Currency
 	balance     Money // Normal bakiye yönüne göre net bakiye
+	version     int64 // Optimistic Concurrency Control (OCC) versiyon numarası
 }
 
-// NewAccount, geçerli verilerle yeni bir Account nesnesi oluşturur (başlangıç bakiyesi 0).
+// NewAccount, geçerli verilerle yeni bir Account nesnesi oluşturur (başlangıç bakiyesi 0, versiyon 1).
 func NewAccount(id, name string, accountType AccountType, currency Currency) (Account, error) {
+	return NewAccountWithVersion(id, name, accountType, currency, 1)
+}
+
+// NewAccountWithVersion, belirli bir versiyon ile yeni bir Account nesnesi oluşturur.
+func NewAccountWithVersion(id, name string, accountType AccountType, currency Currency, version int64) (Account, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return Account{}, ErrEmptyAccountID
@@ -65,6 +71,9 @@ func NewAccount(id, name string, accountType AccountType, currency Currency) (Ac
 	if currency.IsZero() {
 		return Account{}, ErrInvalidCurrency
 	}
+	if version < 1 {
+		version = 1
+	}
 
 	zeroMoney, err := NewZeroMoney(currency)
 	if err != nil {
@@ -77,6 +86,7 @@ func NewAccount(id, name string, accountType AccountType, currency Currency) (Ac
 		accountType: accountType,
 		currency:    currency,
 		balance:     zeroMoney,
+		version:     version,
 	}, nil
 }
 
@@ -105,10 +115,16 @@ func (a Account) Balance() Money {
 	return a.balance
 }
 
+// Version, hesabın Optimistic Concurrency Control versiyon numarasını döner.
+func (a Account) Version() int64 {
+	return a.version
+}
+
 // ApplyEntry, bir işlem girdisini hesaba uygulayarak yeni bir Account kopyası döner (Pure Domain/Immutability).
 // Normal bakiyeye göre:
 // - Eğer girdinin yönü hesabın normal yönü ile aynıysa bakiye artar.
 // - Eğer girdinin yönü zıtsa bakiye azalır.
+// Ayrıca hesabın versiyonu (version) 1 arttırılır (OCC).
 func (a Account) ApplyEntry(entry Entry) (Account, error) {
 	if entry.AccountID() != a.id {
 		return Account{}, fmt.Errorf("girdi hesap ID'si (%s) ile hedef hesap ID'si (%s) uyuşmuyor", entry.AccountID(), a.id)
@@ -134,5 +150,6 @@ func (a Account) ApplyEntry(entry Entry) (Account, error) {
 
 	updated := a
 	updated.balance = newBalance
+	updated.version = a.version + 1
 	return updated, nil
 }

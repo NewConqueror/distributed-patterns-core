@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"time"
 
+	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/concurrency"
 	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/domain"
 	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/idempotency"
 	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/infrastructure/repository"
+	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/snapshot"
 )
 
 // EntryDTO, dış dünyadan gelen işlem girdisi formatıdır.
@@ -36,10 +38,11 @@ type TransactionResponse struct {
 	IsCached      bool      `json:"is_cached"`
 }
 
-// LedgerService, idempotent işlem yönetimini koordine eden servis katmanıdır.
+// LedgerService, idempotent işlem yönetimini, kilitleme stratejilerini ve snapshot motorunu koordine eden servis katmanıdır.
 type LedgerService struct {
-	repo         *repository.PostgresLedgerRepository
-	stateMachine *idempotency.StateMachine
+	repo           *repository.PostgresLedgerRepository
+	stateMachine   *idempotency.StateMachine
+	snapshotWorker *snapshot.SnapshotWorker
 }
 
 // NewLedgerService, yeni bir LedgerService örneği oluşturur.
@@ -51,40 +54,53 @@ func NewLedgerService(repo *repository.PostgresLedgerRepository) *LedgerService 
 	}
 }
 
-// CreateTransaction, Idempotency-Key doğrulaması ve atomik veritabanı kaydıyla işlemi yürütür.
-func (s *LedgerService) CreateTransaction(ctx context.Context, idempotencyKey string, rawPayload []byte) (*TransactionResponse, int, error) {
+// SetSnapshotWorker, asenkron snapshot pipeline worker'ını servise bağlar.
+func (s *LedgerService) SetSnapshotWorker(w *snapshot.SnapshotWorker) {
+	s.snapshotWorker = w
+}
+
+// parseAndValidateRequest, istek gövdesini doğrular ve domain Transaction nesnesini üretir.
+func (s *LedgerService) parseAndValidateRequest(rawPayload []byte) (domain.Transaction, error) {
 	var req CreateTransactionRequest
 	if err := json.Unmarshal(rawPayload, &req); err != nil {
-		return nil, 400, fmt.Errorf("geçersiz istek gövdesi (JSON hatası): %w", err)
+		return domain.Transaction{}, fmt.Errorf("geçersiz istek gövdesi (JSON hatası): %w", err)
 	}
 
 	curr, err := domain.NewCurrency(req.Currency, 2)
 	if err != nil {
-		return nil, 400, err
+		return domain.Transaction{}, err
 	}
 
-	// Domain Entries oluştur
 	var entries []domain.Entry
 	for i, e := range req.Entries {
 		money, err := domain.NewPositiveMoney(e.Amount, curr)
 		if err != nil {
-			return nil, 400, fmt.Errorf("girdi #%d geçersiz tutar: %w", i+1, err)
+			return domain.Transaction{}, fmt.Errorf("girdi #%d geçersiz tutar: %w", i+1, err)
 		}
 		entryID := fmt.Sprintf("%s-e%d", req.TransactionID, i+1)
 		entry, err := domain.NewEntry(entryID, e.AccountID, domain.Direction(e.Direction), money)
 		if err != nil {
-			return nil, 400, fmt.Errorf("girdi #%d doğrulanamadı: %w", i+1, err)
+			return domain.Transaction{}, fmt.Errorf("girdi #%d doğrulanamadı: %w", i+1, err)
 		}
 		entries = append(entries, entry)
 	}
 
-	// Domain Transaction oluştur ve çift taraflı denkliği doğrula
-	tx, err := domain.NewTransaction(req.TransactionID, time.Now().UTC(), req.Description, entries)
+	return domain.NewTransaction(req.TransactionID, time.Now().UTC(), req.Description, entries)
+}
+
+// CreateTransaction, varsayılan olarak atomik veritabanı kaydıyla işlemi yürütür.
+func (s *LedgerService) CreateTransaction(ctx context.Context, idempotencyKey string, rawPayload []byte) (*TransactionResponse, int, error) {
+	return s.CreateTransactionWithPessimisticLock(ctx, idempotencyKey, rawPayload)
+}
+
+// CreateTransactionWithPessimisticLock, Pessimistic Locking (SELECT ... FOR UPDATE) ile
+// hesapları deterministik sırada kilitleyerek deadlock riski olmadan işlemi yürütür.
+func (s *LedgerService) CreateTransactionWithPessimisticLock(ctx context.Context, idempotencyKey string, rawPayload []byte) (*TransactionResponse, int, error) {
+	tx, err := s.parseAndValidateRequest(rawPayload)
 	if err != nil {
-		return nil, 422, fmt.Errorf("işlem çift taraflı muhasebe kuralına uymuyor: %w", err)
+		return nil, 422, err
 	}
 
-	// Idempotency State Machine üzerinden yürüt
 	reqHash := idempotency.ComputeRequestHash(rawPayload)
 
 	result, err := s.stateMachine.Process(ctx, idempotencyKey, rawPayload, func(execCtx context.Context) (int, []byte, error) {
@@ -101,19 +117,88 @@ func (s *LedgerService) CreateTransaction(ctx context.Context, idempotencyKey st
 			return 500, nil, err
 		}
 
-		// TEK BIR BEGIN ... COMMIT BLOĞUNDA:
-		// 1. Idempotency IN_FLIGHT
-		// 2. Transaction & Entries INSERT
-		// 3. Idempotency RESOLVED
-		// 4. COMMIT (PostgreSQL DEFERRABLE TRIGGER tetiklenir)
-		err = s.repo.ExecuteAtomicLedgerTransaction(execCtx, idempotencyKey, reqHash, tx, 201, respBytes)
+		// Pessimistic kilitleme ve atomik kayıt
+		err = s.repo.ExecuteAtomicLedgerTransactionWithPessimisticLock(execCtx, idempotencyKey, reqHash, tx, 201, respBytes)
 		if err != nil {
-			return 500, nil, fmt.Errorf("veritabanı atomik işlemi başarısız: %w", err)
+			return 500, nil, fmt.Errorf("pessimistic kayıt hatası: %w", err)
+		}
+
+		// İşlem başarılı -> Etkilenen hesapları snapshot worker'a bildir
+		if s.snapshotWorker != nil {
+			for _, e := range tx.Entries() {
+				s.snapshotWorker.NotifyAccountActivity(e.AccountID())
+			}
 		}
 
 		return 201, respBytes, nil
 	})
 
+	return s.handleResult(result, err)
+}
+
+// CreateTransactionWithOCC, Optimistic Concurrency Control (OCC) kullanarak işlemi yürütür.
+// Versiyon çakışması (ErrOptimisticLockConflict) olursa üst katmanda Exponential Backoff ile yeniden dener.
+func (s *LedgerService) CreateTransactionWithOCC(ctx context.Context, idempotencyKey string, rawPayload []byte, retryCfg concurrency.RetryConfig) (*TransactionResponse, int, error) {
+	tx, err := s.parseAndValidateRequest(rawPayload)
+	if err != nil {
+		return nil, 422, err
+	}
+
+	reqHash := idempotency.ComputeRequestHash(rawPayload)
+
+	result, err := s.stateMachine.Process(ctx, idempotencyKey, rawPayload, func(execCtx context.Context) (int, []byte, error) {
+		resp := TransactionResponse{
+			TransactionID: tx.ID(),
+			Status:        "RESOLVED",
+			Currency:      tx.Currency().Code(),
+			TotalAmount:   tx.TotalAmount().Amount(),
+			CreatedAt:     tx.Timestamp(),
+			IsCached:      false,
+		}
+		respBytes, err := json.Marshal(resp)
+		if err != nil {
+			return 500, nil, err
+		}
+
+		// OCC yeniden deneme (retry) döngüsü
+		retryErr := concurrency.ExecuteWithRetry(execCtx, retryCfg, func(attempt int) error {
+			// İlgili hesapların güncel versiyonlarını oku
+			expectedVersions := make(map[string]int64)
+			for _, e := range tx.Entries() {
+				acc, err := s.repo.GetAccountByID(execCtx, e.AccountID())
+				if err != nil {
+					return err
+				}
+				expectedVersions[e.AccountID()] = acc.Version()
+			}
+
+			// OCC ile atomik olarak versiyonu kontrol et ve kaydet
+			return s.repo.ExecuteAtomicLedgerTransactionWithOCC(execCtx, idempotencyKey, reqHash, tx, expectedVersions, 201, respBytes)
+		})
+
+		if retryErr != nil {
+			return 500, nil, retryErr
+		}
+
+		// Başarılı işlem sonrası snapshot worker'a bildirim
+		if s.snapshotWorker != nil {
+			for _, e := range tx.Entries() {
+				s.snapshotWorker.NotifyAccountActivity(e.AccountID())
+			}
+		}
+
+		return 201, respBytes, nil
+	})
+
+	return s.handleResult(result, err)
+}
+
+// GetAccountBalance, Snapshotting Engine kullanarak hesabın anlık bakiyesini hızlıca hesaplar.
+func (s *LedgerService) GetAccountBalance(ctx context.Context, accountID string) (domain.Money, error) {
+	return s.repo.GetAccountBalanceFast(ctx, accountID)
+}
+
+func (s *LedgerService) handleResult(result *idempotency.Result, err error) (*TransactionResponse, int, error) {
 	if err != nil {
 		if err == idempotency.ErrIdempotencyKeyReuseWithDifferentPayload {
 			return nil, 422, err

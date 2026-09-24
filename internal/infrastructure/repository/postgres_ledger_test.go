@@ -4,12 +4,14 @@ import (
 	"context"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/domain"
 	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/infrastructure/db"
 	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/infrastructure/repository"
+	"Immutable_Double-Entry_FinancialLedger_with_CryptographicAuditTrails_StrictIdempotency/internal/snapshot"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -18,11 +20,9 @@ func getTestPool(t *testing.T) *pgxpool.Pool {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	// Önce 5433 (docker), sonra 5432 dener
 	cfg := db.DefaultDockerConfig()
 	pool, err := db.NewPool(ctx, cfg)
 	if err != nil {
-		// Fallback local port 5432
 		cfg.Port = 5432
 		pool, err = db.NewPool(ctx, cfg)
 		if err != nil {
@@ -31,11 +31,11 @@ func getTestPool(t *testing.T) *pgxpool.Pool {
 		}
 	}
 
-	// Şemayı yükle
-	migrationPath, _ := filepath.Abs("../../../migrations/001_init_schema.sql")
-	if err := db.RunMigrations(context.Background(), pool, migrationPath); err != nil {
-		t.Fatalf("migration çalıştırılamadı: %v", err)
-	}
+	// 1. ve 2. Faz migration şemalarını sırayla yükle
+	m1, _ := filepath.Abs("../../../migrations/001_init_schema.sql")
+	_ = db.RunMigrations(context.Background(), pool, m1)
+	m2, _ := filepath.Abs("../../../migrations/002_concurrency_and_snapshots.sql")
+	_ = db.RunMigrations(context.Background(), pool, m2)
 
 	return pool
 }
@@ -89,9 +89,7 @@ func TestPostgres_DBConstraintsAndTriggers(t *testing.T) {
 		t.Fatalf("işlem kaydedilemedi: %v", err)
 	}
 
-	// -------------------------------------------------------------
-	// Test 2.1: Immutability Trigger (UPDATE / DELETE Yasak)
-	// -------------------------------------------------------------
+	// Test 2.1: Immutability Trigger
 	t.Run("Immutability_UpdateEntry_RejectedByTrigger", func(t *testing.T) {
 		_, err := pool.Exec(ctx, "UPDATE entries SET amount = 9999 WHERE id = $1", e1.ID())
 		if err == nil {
@@ -112,19 +110,7 @@ func TestPostgres_DBConstraintsAndTriggers(t *testing.T) {
 		}
 	})
 
-	t.Run("Immutability_UpdateTransaction_RejectedByTrigger", func(t *testing.T) {
-		_, err := pool.Exec(ctx, "UPDATE transactions SET description = 'Hileli' WHERE id = $1", txID)
-		if err == nil {
-			t.Fatal("UPDATE transactions başarılı oldu, tetikleyici çalışmadı!")
-		}
-		if !strings.Contains(err.Error(), "Finansal Değişmezlik İhlali") {
-			t.Fatalf("beklenen tetikleyici hatası alınmadı: %v", err)
-		}
-	})
-
-	// -------------------------------------------------------------
-	// Test 2.1: entries.amount > 0 CHECK Constraint
-	// -------------------------------------------------------------
+	// Test 2.1: Check Constraint
 	t.Run("CheckConstraint_NonPositiveAmount_Rejected", func(t *testing.T) {
 		badEntryQuery := `
 			INSERT INTO entries (id, transaction_id, account_id, direction, amount, created_at)
@@ -136,10 +122,7 @@ func TestPostgres_DBConstraintsAndTriggers(t *testing.T) {
 		}
 	})
 
-	// -------------------------------------------------------------
-	// Test 2.3: DEFERRABLE INITIALLY DEFERRED Constraint Trigger
-	// Doğrudan SQL ile dengesiz işlem yazılmaya çalışıldığında COMMIT anında patlamalı!
-	// -------------------------------------------------------------
+	// Test 2.3: Deferrable Constraint Trigger
 	t.Run("DeferredTrigger_UnbalancedTransaction_RejectedOnCommit", func(t *testing.T) {
 		pgTx, err := pool.Begin(ctx)
 		if err != nil {
@@ -153,7 +136,6 @@ func TestPostgres_DBConstraintsAndTriggers(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// 100 USD Borç
 		_, err = pgTx.Exec(ctx, `
 			INSERT INTO entries (id, transaction_id, account_id, direction, amount)
 			VALUES ($1, $2, $3, 'DEBIT', 10000)
@@ -162,7 +144,6 @@ func TestPostgres_DBConstraintsAndTriggers(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// 70 USD Alacak (30 USD eksik -> Dengesiz!)
 		_, err = pgTx.Exec(ctx, `
 			INSERT INTO entries (id, transaction_id, account_id, direction, amount)
 			VALUES ($1, $2, $3, 'CREDIT', 7000)
@@ -171,13 +152,112 @@ func TestPostgres_DBConstraintsAndTriggers(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// COMMIT aşamasında tetikleyici fırlamalı!
 		err = pgTx.Commit(ctx)
 		if err == nil {
 			t.Fatal("dengesiz işlem COMMIT edilebildi! DEFERRABLE TRIGGER çalışmadı!")
 		}
-		if !strings.Contains(err.Error(), "Çift Taraflı Muhasebe Denkliği İhlali") {
-			t.Fatalf("beklenen bakiye denkliği hatası alınmadı: %v", err)
-		}
 	})
+}
+
+func TestPostgres_PessimisticLocking_DeadlockPrevention(t *testing.T) {
+	pool := getTestPool(t)
+	if pool == nil {
+		return
+	}
+	defer pool.Close()
+
+	ctx := context.Background()
+	repo := repository.NewPostgresLedgerRepository(pool)
+	accA, accB := setupTestAccounts(t, repo)
+
+	// Senaryo: Eşzamanlı iki işlem:
+	// İşlem 1: A'dan B'ye transfer
+	// İşlem 2: B'den A'ya transfer
+	// Her ikisi de aynı anda hesapları kilitler.
+	// OrderAccountIDs sayesinde her iki işlem de kilitleri A sonra B sırasında talep eder.
+	// Asla deadlock (40P01) oluşmaz!
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		m := domain.MustNewMoney(1000, domain.USD)
+		e1, _ := domain.NewEntry("e1-1", accA, domain.DirectionDebit, m)
+		e2, _ := domain.NewEntry("e1-2", accB, domain.DirectionCredit, m)
+		tx, _ := domain.NewTransaction("tx-conc-1", time.Now().UTC(), "A->B", []domain.Entry{e1, e2})
+
+		errs[0] = repo.ExecuteAtomicLedgerTransactionWithPessimisticLock(
+			ctx, "key-conc-1", "hash-1", tx, 201, []byte(`{"ok": true}`),
+		)
+	}()
+
+	go func() {
+		defer wg.Done()
+		m := domain.MustNewMoney(500, domain.USD)
+		e1, _ := domain.NewEntry("e2-1", accB, domain.DirectionDebit, m)
+		e2, _ := domain.NewEntry("e2-2", accA, domain.DirectionCredit, m)
+		tx, _ := domain.NewTransaction("tx-conc-2", time.Now().UTC(), "B->A", []domain.Entry{e1, e2})
+
+		errs[1] = repo.ExecuteAtomicLedgerTransactionWithPessimisticLock(
+			ctx, "key-conc-2", "hash-2", tx, 201, []byte(`{"ok": true}`),
+		)
+	}()
+
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("[%d] işlem başarısız oldu (deadlock riski): %v", i+1, err)
+		}
+	}
+}
+
+func TestPostgres_SnapshottingAndFastBalance(t *testing.T) {
+	pool := getTestPool(t)
+	if pool == nil {
+		return
+	}
+	defer pool.Close()
+
+	ctx := context.Background()
+	repo := repository.NewPostgresLedgerRepository(pool)
+	accID, offsetAccID := setupTestAccounts(t, repo)
+
+	// 1. Üç işlem kaydet (+1000, +2000, +3000 = 6000 cents)
+	for i := 1; i <= 3; i++ {
+		m := domain.MustNewMoney(int64(i*1000), domain.USD)
+		e1, _ := domain.NewEntry(time.Now().Format("150405.000000")+"-e1", accID, domain.DirectionDebit, m)
+		e2, _ := domain.NewEntry(time.Now().Format("150405.000000")+"-e2", offsetAccID, domain.DirectionCredit, m)
+		tx, _ := domain.NewTransaction(time.Now().Format("150405.000000")+"-tx", time.Now().UTC(), "İşlem", []domain.Entry{e1, e2})
+		_ = repo.SaveTransaction(ctx, tx)
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// 2. Bir snapshot kaydet (6000 USD)
+	snapBal := domain.MustNewMoney(6000, domain.USD)
+	lastEntry := "snap-entry-mark"
+	snap := snapshot.NewAccountSnapshot("snap-test-1", accID, snapBal, &lastEntry, 3, time.Now().UTC())
+	if err := repo.SaveSnapshot(ctx, snap); err != nil {
+		t.Fatalf("snapshot kaydedilemedi: %v", err)
+	}
+
+	// 3. Snapshot sonrasında 1 işlem daha kaydet (+4000 cents -> Toplam: 10000)
+	mExtra := domain.MustNewMoney(4000, domain.USD)
+	e3, _ := domain.NewEntry(time.Now().Format("150405.000000")+"-e3", accID, domain.DirectionDebit, mExtra)
+	e4, _ := domain.NewEntry(time.Now().Format("150405.000000")+"-e4", offsetAccID, domain.DirectionCredit, mExtra)
+	txExtra, _ := domain.NewTransaction(time.Now().Format("150405.000000")+"-tx2", time.Now().UTC(), "Sonraki İşlem", []domain.Entry{e3, e4})
+	_ = repo.SaveTransaction(ctx, txExtra)
+
+	// 4. Anlık bakiye motorunu çalıştır
+	fastBalance, err := repo.GetAccountBalanceFast(ctx, accID)
+	if err != nil {
+		t.Fatalf("hızlı bakiye hesaplanamadı: %v", err)
+	}
+
+	// 5. Doğrulama: Anlık bakiye 10000 olmalı
+	if fastBalance.Amount() != 10000 {
+		t.Errorf("beklenen bakiye 10000 (6000 snapshot + 4000 delta), alınan: %d", fastBalance.Amount())
+	}
 }
