@@ -1,0 +1,13 @@
+# Binaries
+/server
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test artifacts and logs
+*.log
+*.out
+scratch/
+coverage.html

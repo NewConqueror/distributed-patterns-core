@@ -20,15 +20,17 @@ func GenesisHash(accountID string) string {
 // ComputeHash, belirtilen matematiksel formüle göre bir kaydın kriptografik hash'ini üretir:
 // Hash_n = SHA256(Hash_{n-1} + TransactionID + Amount + Timestamp)
 func ComputeHash(prevHash string, txID string, amount int64, timestamp time.Time) string {
-	// Deterministik zaman gösterimi (UTC UnixNano)
-	payload := fmt.Sprintf("%s|%s|%d|%d", prevHash, txID, amount, timestamp.UTC().UnixNano())
+	// PostgreSQL timestamptz mikrosaniye çözünürlüğünde saklandığı için Truncate(time.Microsecond) kullanılır
+	tMicro := timestamp.UTC().Truncate(time.Microsecond).UnixMicro()
+	payload := fmt.Sprintf("%s|%s|%d|%d", prevHash, txID, amount, tMicro)
 	hash := sha256.Sum256([]byte(payload))
 	return hex.EncodeToString(hash[:])
 }
 
 // ComputeEntryHash, hesap hareketleri için yön (direction) ve hesap ID'sini de bağlayan genişletilmiş hash üretir.
 func ComputeEntryHash(prevHash string, txID string, accountID string, direction string, amount int64, timestamp time.Time) string {
-	payload := fmt.Sprintf("%s|%s|%s|%s|%d|%d", prevHash, txID, accountID, direction, amount, timestamp.UTC().UnixNano())
+	tMicro := timestamp.UTC().Truncate(time.Microsecond).UnixMicro()
+	payload := fmt.Sprintf("%s|%s|%s|%s|%d|%d", prevHash, txID, accountID, direction, amount, tMicro)
 	hash := sha256.Sum256([]byte(payload))
 	return hex.EncodeToString(hash[:])
 }

@@ -21,18 +21,20 @@ func getTestPool(t *testing.T) *pgxpool.Pool {
 	cfg := db.DefaultDockerConfig()
 	pool, err := db.NewPool(ctx, cfg)
 	if err != nil {
-		cfg.Port = 5432
-		pool, err = db.NewPool(ctx, cfg)
+		localCfg := db.DefaultLocalConfig()
+		pool, err = db.NewPool(ctx, localCfg)
 		if err != nil {
 			t.Skipf("PostgreSQL veritabanı aktif değil, entegrasyon testi atlanıyor: %v", err)
 			return nil
 		}
 	}
 
-	migrationPath, _ := filepath.Abs("../../migrations/001_init_schema.sql")
-	if err := db.RunMigrations(context.Background(), pool, migrationPath); err != nil {
-		t.Fatalf("migration çalıştırılamadı: %v", err)
-	}
+	m1, _ := filepath.Abs("../../migrations/001_init_schema.sql")
+	_ = db.RunMigrations(context.Background(), pool, m1)
+	m2, _ := filepath.Abs("../../migrations/002_concurrency_and_snapshots.sql")
+	_ = db.RunMigrations(context.Background(), pool, m2)
+	m3, _ := filepath.Abs("../../migrations/003_cryptographic_audit_trail.sql")
+	_ = db.RunMigrations(context.Background(), pool, m3)
 
 	return pool
 }

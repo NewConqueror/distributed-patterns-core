@@ -3,6 +3,7 @@ package usecase
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -220,10 +221,10 @@ func (s *LedgerService) GetAccountBalance(ctx context.Context, accountID string)
 
 func (s *LedgerService) handleResult(result *idempotency.Result, err error) (*TransactionResponse, int, error) {
 	if err != nil {
-		if err == idempotency.ErrIdempotencyKeyReuseWithDifferentPayload {
+		if errors.Is(err, idempotency.ErrIdempotencyKeyReuseWithDifferentPayload) {
 			return nil, 422, err
 		}
-		if err == idempotency.ErrIdempotencyKeyInFlight {
+		if errors.Is(err, idempotency.ErrIdempotencyKeyInFlight) {
 			return nil, 409, err
 		}
 		return nil, 500, err

@@ -487,10 +487,11 @@ func (r *PostgresLedgerRepository) ExecuteAtomicLedgerTransaction(
 	}
 	defer func() { _ = pgTx.Rollback(ctx) }()
 
-	// 1. İdempotency kaydı oluştur
+	// 1. İdempotency kaydı oluştur (veya zaten CreateInFlight ile oluşturulduysa güncelle)
 	idempInsert := `
 		INSERT INTO idempotency_keys (key, request_hash, status, locked_at, created_at, updated_at)
 		VALUES ($1, $2, 'IN_FLIGHT', NOW(), NOW(), NOW())
+		ON CONFLICT (key) DO UPDATE SET updated_at = NOW()
 	`
 	if _, err := pgTx.Exec(ctx, idempInsert, idempKey, requestHash); err != nil {
 		return fmt.Errorf("idempotency anahtarı kilitlenemedi: %w", err)
@@ -608,6 +609,7 @@ func (r *PostgresLedgerRepository) ExecuteAtomicLedgerTransactionWithPessimistic
 	idempInsert := `
 		INSERT INTO idempotency_keys (key, request_hash, status, locked_at, created_at, updated_at)
 		VALUES ($1, $2, 'IN_FLIGHT', NOW(), NOW(), NOW())
+		ON CONFLICT (key) DO UPDATE SET updated_at = NOW()
 	`
 	if _, err := pgTx.Exec(ctx, idempInsert, idempKey, requestHash); err != nil {
 		return fmt.Errorf("idempotency anahtarı kilitlenemedi: %w", err)
@@ -669,6 +671,7 @@ func (r *PostgresLedgerRepository) ExecuteAtomicLedgerTransactionWithOCC(
 	idempInsert := `
 		INSERT INTO idempotency_keys (key, request_hash, status, locked_at, created_at, updated_at)
 		VALUES ($1, $2, 'IN_FLIGHT', NOW(), NOW(), NOW())
+		ON CONFLICT (key) DO UPDATE SET updated_at = NOW()
 	`
 	if _, err := pgTx.Exec(ctx, idempInsert, idempKey, requestHash); err != nil {
 		return fmt.Errorf("idempotency anahtarı kilitlenemedi: %w", err)

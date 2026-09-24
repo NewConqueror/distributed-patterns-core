@@ -2,6 +2,7 @@ package repository_test
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -24,8 +25,8 @@ func getTestPool(t *testing.T) *pgxpool.Pool {
 	cfg := db.DefaultDockerConfig()
 	pool, err := db.NewPool(ctx, cfg)
 	if err != nil {
-		cfg.Port = 5432
-		pool, err = db.NewPool(ctx, cfg)
+		localCfg := db.DefaultLocalConfig()
+		pool, err = db.NewPool(ctx, localCfg)
 		if err != nil {
 			t.Skipf("PostgreSQL veritabanı aktif değil, entegrasyon testi atlanıyor: %v", err)
 			return nil
@@ -187,24 +188,26 @@ func TestPostgres_PessimisticLocking_DeadlockPrevention(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		m := domain.MustNewMoney(1000, domain.USD)
-		e1, _ := domain.NewEntry("e1-1", accA, domain.DirectionDebit, m)
-		e2, _ := domain.NewEntry("e1-2", accB, domain.DirectionCredit, m)
-		tx, _ := domain.NewTransaction("tx-conc-1", time.Now().UTC(), "A->B", []domain.Entry{e1, e2})
+		nowStr := fmt.Sprintf("%d", time.Now().UnixNano())
+		e1, _ := domain.NewEntry("e1-1-"+nowStr, accA, domain.DirectionDebit, m)
+		e2, _ := domain.NewEntry("e1-2-"+nowStr, accB, domain.DirectionCredit, m)
+		tx, _ := domain.NewTransaction("tx-conc-1-"+nowStr, time.Now().UTC(), "A->B", []domain.Entry{e1, e2})
 
 		errs[0] = repo.ExecuteAtomicLedgerTransactionWithPessimisticLock(
-			ctx, "key-conc-1", "hash-1", tx, 201, []byte(`{"ok": true}`),
+			ctx, "key-conc-1-"+nowStr, "hash-1", tx, 201, []byte(`{"ok": true}`),
 		)
 	}()
 
 	go func() {
 		defer wg.Done()
 		m := domain.MustNewMoney(500, domain.USD)
-		e1, _ := domain.NewEntry("e2-1", accB, domain.DirectionDebit, m)
-		e2, _ := domain.NewEntry("e2-2", accA, domain.DirectionCredit, m)
-		tx, _ := domain.NewTransaction("tx-conc-2", time.Now().UTC(), "B->A", []domain.Entry{e1, e2})
+		nowStr := fmt.Sprintf("%d", time.Now().UnixNano())
+		e1, _ := domain.NewEntry("e2-1-"+nowStr, accB, domain.DirectionDebit, m)
+		e2, _ := domain.NewEntry("e2-2-"+nowStr, accA, domain.DirectionCredit, m)
+		tx, _ := domain.NewTransaction("tx-conc-2-"+nowStr, time.Now().UTC(), "B->A", []domain.Entry{e1, e2})
 
 		errs[1] = repo.ExecuteAtomicLedgerTransactionWithPessimisticLock(
-			ctx, "key-conc-2", "hash-2", tx, 201, []byte(`{"ok": true}`),
+			ctx, "key-conc-2-"+nowStr, "hash-2", tx, 201, []byte(`{"ok": true}`),
 		)
 	}()
 
@@ -229,19 +232,21 @@ func TestPostgres_SnapshottingAndFastBalance(t *testing.T) {
 	accID, offsetAccID := setupTestAccounts(t, repo)
 
 	// 1. Üç işlem kaydet (+1000, +2000, +3000 = 6000 cents)
+	var lastSavedEntryID string
 	for i := 1; i <= 3; i++ {
 		m := domain.MustNewMoney(int64(i*1000), domain.USD)
-		e1, _ := domain.NewEntry(time.Now().Format("150405.000000")+"-e1", accID, domain.DirectionDebit, m)
-		e2, _ := domain.NewEntry(time.Now().Format("150405.000000")+"-e2", offsetAccID, domain.DirectionCredit, m)
-		tx, _ := domain.NewTransaction(time.Now().Format("150405.000000")+"-tx", time.Now().UTC(), "İşlem", []domain.Entry{e1, e2})
+		e1, _ := domain.NewEntry(fmt.Sprintf("%s-e1-%d", time.Now().Format("150405.000000"), i), accID, domain.DirectionDebit, m)
+		e2, _ := domain.NewEntry(fmt.Sprintf("%s-e2-%d", time.Now().Format("150405.000000"), i), offsetAccID, domain.DirectionCredit, m)
+		tx, _ := domain.NewTransaction(fmt.Sprintf("%s-tx-%d", time.Now().Format("150405.000000"), i), time.Now().UTC(), "İşlem", []domain.Entry{e1, e2})
 		_ = repo.SaveTransaction(ctx, tx)
+		lastSavedEntryID = e1.ID()
 		time.Sleep(5 * time.Millisecond)
 	}
 
 	// 2. Bir snapshot kaydet (6000 USD)
 	snapBal := domain.MustNewMoney(6000, domain.USD)
-	lastEntry := "snap-entry-mark"
-	snap := snapshot.NewAccountSnapshot("snap-test-1", accID, snapBal, &lastEntry, 3, time.Now().UTC())
+	snapID := fmt.Sprintf("snap-%d", time.Now().UnixNano())
+	snap := snapshot.NewAccountSnapshot(snapID, accID, snapBal, &lastSavedEntryID, 3, time.Now().UTC())
 	if err := repo.SaveSnapshot(ctx, snap); err != nil {
 		t.Fatalf("snapshot kaydedilemedi: %v", err)
 	}
@@ -277,18 +282,19 @@ func TestPostgres_CryptographicHashChainAndAudit(t *testing.T) {
 	accID, offsetAccID := setupTestAccounts(t, repo)
 
 	// 1. İki işlem kaydet
+	nowStr := fmt.Sprintf("%d", time.Now().UnixNano())
 	m1 := domain.MustNewMoney(5000, domain.USD)
-	e1, _ := domain.NewEntry("e-audit-1", accID, domain.DirectionDebit, m1)
-	e2, _ := domain.NewEntry("e-audit-2", offsetAccID, domain.DirectionCredit, m1)
-	tx1, _ := domain.NewTransaction("tx-audit-1", time.Now().UTC(), "İşlem 1", []domain.Entry{e1, e2})
+	e1, _ := domain.NewEntry("e-audit-1-"+nowStr, accID, domain.DirectionDebit, m1)
+	e2, _ := domain.NewEntry("e-audit-2-"+nowStr, offsetAccID, domain.DirectionCredit, m1)
+	tx1, _ := domain.NewTransaction("tx-audit-1-"+nowStr, time.Now().UTC(), "İşlem 1", []domain.Entry{e1, e2})
 	if err := repo.SaveTransaction(ctx, tx1); err != nil {
 		t.Fatal(err)
 	}
 
 	m2 := domain.MustNewMoney(3000, domain.USD)
-	e3, _ := domain.NewEntry("e-audit-3", accID, domain.DirectionDebit, m2)
-	e4, _ := domain.NewEntry("e-audit-4", offsetAccID, domain.DirectionCredit, m2)
-	tx2, _ := domain.NewTransaction("tx-audit-2", time.Now().UTC(), "İşlem 2", []domain.Entry{e3, e4})
+	e3, _ := domain.NewEntry("e-audit-3-"+nowStr, accID, domain.DirectionDebit, m2)
+	e4, _ := domain.NewEntry("e-audit-4-"+nowStr, offsetAccID, domain.DirectionCredit, m2)
+	tx2, _ := domain.NewTransaction("tx-audit-2-"+nowStr, time.Now().UTC(), "İşlem 2", []domain.Entry{e3, e4})
 	if err := repo.SaveTransaction(ctx, tx2); err != nil {
 		t.Fatal(err)
 	}

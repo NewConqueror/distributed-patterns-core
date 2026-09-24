@@ -27,8 +27,23 @@ func (c Config) ConnectionString() string {
 	if ssl == "" {
 		ssl = "disable"
 	}
-	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s",
-		c.User, c.Password, c.Host, c.Port, c.Database, ssl)
+
+	// Eğer Host unix domain socket yoluysa (/var/run/postgresql gibi)
+	if strings.HasPrefix(c.Host, "/") {
+		if c.Password != "" {
+			return fmt.Sprintf("host=%s user=%s password=%s dbname=%s sslmode=%s",
+				c.Host, c.User, c.Password, c.Database, ssl)
+		}
+		return fmt.Sprintf("host=%s user=%s dbname=%s sslmode=%s",
+			c.Host, c.User, c.Database, ssl)
+	}
+
+	if c.Password != "" {
+		return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s",
+			c.User, c.Password, c.Host, c.Port, c.Database, ssl)
+	}
+	return fmt.Sprintf("postgres://%s@%s:%d/%s?sslmode=%s",
+		c.User, c.Host, c.Port, c.Database, ssl)
 }
 
 // DefaultDockerConfig, docker-compose için varsayılan yapılandırma
@@ -43,6 +58,22 @@ func DefaultDockerConfig() Config {
 	}
 }
 
+// DefaultLocalConfig, yerel makinedeki PostgreSQL için yapılandırma (Unix Domain Socket)
+func DefaultLocalConfig() Config {
+	user := os.Getenv("USER")
+	if user == "" {
+		user = "fatih"
+	}
+	return Config{
+		Host:     "/var/run/postgresql",
+		Port:     5432,
+		User:     user,
+		Password: "",
+		Database: "financial_ledger",
+		SSLMode:  "disable",
+	}
+}
+
 // NewPool, PostgreSQL bağlantı havuzunu (pool) ilklendirir ve ping atar.
 func NewPool(ctx context.Context, cfg Config) (*pgxpool.Pool, error) {
 	connStr := cfg.ConnectionString()
@@ -51,8 +82,15 @@ func NewPool(ctx context.Context, cfg Config) (*pgxpool.Pool, error) {
 		return nil, fmt.Errorf("geçersiz veritabanı bağlantı dizesi: %w", err)
 	}
 
-	poolConfig.MaxConns = 25
-	poolConfig.MinConns = 5
+	maxConns := int32(50)
+	if envMax := os.Getenv("DB_MAX_CONNS"); envMax != "" {
+		var n int32
+		if _, err := fmt.Sscanf(envMax, "%d", &n); err == nil && n > 0 {
+			maxConns = n
+		}
+	}
+	poolConfig.MaxConns = maxConns
+	poolConfig.MinConns = 10
 	poolConfig.MaxConnLifetime = 30 * time.Minute
 	poolConfig.MaxConnIdleTime = 5 * time.Minute
 
