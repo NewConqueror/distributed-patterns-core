@@ -28,6 +28,9 @@ type Config struct {
 	// Circuit Breaker & Backoff
 	CBInitialBackoff time.Duration
 	CBMaxBackoff     time.Duration
+
+	// Observability & Metrics
+	MetricsAddr string
 }
 
 func LoadConfig() *Config {
@@ -43,6 +46,7 @@ func LoadConfig() *Config {
 		DLQTopic:                 getEnv("DLQ_TOPIC", "cdc.products.dlq"),
 		CBInitialBackoff:         time.Duration(getEnvInt("CB_INITIAL_BACKOFF_SEC", 1)) * time.Second,
 		CBMaxBackoff:             time.Duration(getEnvInt("CB_MAX_BACKOFF_SEC", 16)) * time.Second,
+		MetricsAddr:              getEnv("METRICS_ADDR", ":2112"),
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium/internal/circuitbreaker"
 	"Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium/internal/dlq"
 	"Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium/internal/elasticsearch"
+	"Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium/internal/metrics"
 	"Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium/internal/model"
 )
 
@@ -151,11 +152,45 @@ func (b *Batcher) flush(ctx context.Context) error {
 		log.Printf("[ES Bulk Success] Processed %d documents in %v (ES Took: %dms, HasErrors: %v)",
 			len(validBulkItems), elapsed, bulkResult.Response.Took, bulkResult.Response.Errors)
 
+		// Record Prometheus Metrics for Bulk Flush & Batch Size
+		metrics.RecordBulkFlush(elapsed.Seconds())
+		metrics.SetBatchSize(float64(len(validBulkItems)))
+
+		// Calculate End-to-End Latency: T_indexed - T_wal_commit
+		var totalLatencyMs int64
+		var latencyCount int64
+		now := time.Now()
+
+		for _, item := range validBulkItems {
+			if _, isFailed := bulkResult.PermanentMap[item.ID]; isFailed {
+				metrics.RecordEventConsumed("failure")
+				continue
+			}
+			metrics.RecordEventConsumed("success")
+
+			if item.SourceTsMs > 0 {
+				commitTime := time.UnixMilli(item.SourceTsMs)
+				diff := now.Sub(commitTime)
+				if diff > 0 {
+					metrics.RecordE2ELatency(diff.Seconds())
+					totalLatencyMs += diff.Milliseconds()
+					latencyCount++
+				}
+			}
+		}
+
+		if latencyCount > 0 {
+			avgLatency := totalLatencyMs / latencyCount
+			log.Printf("[E2E Latency Benchmark] Average E2E Latency: %dms (Postgres WAL Commit -> ES Indexed) [n=%d]",
+				avgLatency, latencyCount)
+		}
+
 		// 2. Handle Permanent Item Failures (Route to DLQ)
 		if len(bulkResult.PermanentMap) > 0 {
 			log.Printf("[DLQ Notice] Routing %d permanently failed items to DLQ...", len(bulkResult.PermanentMap))
 			for _, item := range validBulkItems {
 				if reason, isFailed := bulkResult.PermanentMap[item.ID]; isFailed {
+					metrics.RecordDLQEvent(dlq.ErrorTypeMappingConflict)
 					if dlqErr := b.dlqProducer.Publish(ctx, item.KafkaMsg, dlq.ErrorTypeMappingConflict, reason); dlqErr != nil {
 						log.Printf("[DLQ Error] Failed to publish message %s to DLQ: %v", item.ID, dlqErr)
 					}

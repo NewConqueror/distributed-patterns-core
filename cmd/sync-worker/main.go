@@ -12,6 +12,7 @@ import (
 	"Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium/internal/config"
 	"Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium/internal/dlq"
 	"Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium/internal/elasticsearch"
+	"Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium/internal/metrics"
 	"Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium/internal/pipeline"
 	"Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium/internal/transformer"
 )
@@ -68,7 +69,11 @@ func main() {
 	// 7. Pipeline Consumer with Pause/Resume and Poison Pill isolation
 	consumer := pipeline.NewConsumer(cfg, trans, batcher, kafkaReader, dlqProducer, cb)
 
-	// 8. Graceful Shutdown Setup (SIGINT, SIGTERM)
+	// 8. Prometheus Metrics Server
+	metricsSrv := metrics.StartMetricsServer(cfg.MetricsAddr)
+	defer metrics.ShutdownMetricsServer(metricsSrv)
+
+	// 9. Graceful Shutdown Setup (SIGINT, SIGTERM)
 	ctx, cancel := context.WithCancel(context.Background())
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
@@ -87,8 +92,8 @@ func main() {
 		}
 	}()
 
-	log.Printf("[Worker Active] Topic: '%s' -> Index: '%s' | DLQ: '%s' | Batch: %d (%v)",
-		cfg.KafkaTopic, cfg.ElasticsearchIndex, cfg.DLQTopic, cfg.BatchSize, cfg.FlushInterval)
+	log.Printf("[Worker Active] Topic: '%s' -> Index: '%s' | DLQ: '%s' | Batch: %d (%v) | Metrics: http://localhost%s/metrics",
+		cfg.KafkaTopic, cfg.ElasticsearchIndex, cfg.DLQTopic, cfg.BatchSize, cfg.FlushInterval, cfg.MetricsAddr)
 
 	// Wait for OS shutdown signal
 	sig := <-sigChan

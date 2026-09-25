@@ -20,6 +20,7 @@ type BulkItem struct {
 	Document    any
 	KafkaMsg    kafka.Message
 	IsTombstone bool
+	SourceTsMs  int64 // PostgreSQL WAL commit timestamp for E2E latency calculation
 }
 
 // BulkResponse represents the response from Elasticsearch _bulk API

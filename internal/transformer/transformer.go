@@ -64,12 +64,18 @@ func (t *Transformer) Transform(msg kafka.Message) (*model.BulkItem, error) {
 			}
 		}
 
+		sourceTs := envelope.Source.TsMs
+		if sourceTs == 0 {
+			sourceTs = envelope.TsMs
+		}
+
 		return &model.BulkItem{
-			Action:   model.ActionDelete,
-			ID:       docID,
-			Index:    t.targetIndex,
-			Version:  version,
-			KafkaMsg: msg,
+			Action:     model.ActionDelete,
+			ID:         docID,
+			Index:      t.targetIndex,
+			Version:    version,
+			KafkaMsg:   msg,
+			SourceTsMs: sourceTs,
 		}, nil
 
 	case model.OpCreate, model.OpUpdate, model.OpRead:
@@ -100,13 +106,19 @@ func (t *Transformer) Transform(msg kafka.Message) (*model.BulkItem, error) {
 			IndexedAt:    time.Now().UTC(),
 		}
 
+		sourceTs := envelope.Source.TsMs
+		if sourceTs == 0 {
+			sourceTs = envelope.TsMs
+		}
+
 		return &model.BulkItem{
-			Action:   model.ActionIndex,
-			ID:       raw.ID,
-			Index:    t.targetIndex,
-			Version:  raw.Version,
-			Document: doc,
-			KafkaMsg: msg,
+			Action:     model.ActionIndex,
+			ID:         raw.ID,
+			Index:      t.targetIndex,
+			Version:    raw.Version,
+			Document:   doc,
+			KafkaMsg:   msg,
+			SourceTsMs: sourceTs,
 		}, nil
 
 	default:

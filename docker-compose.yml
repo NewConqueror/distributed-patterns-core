@@ -138,6 +138,8 @@ services:
       dockerfile: Dockerfile
     container_name: cdc_sync_worker
     restart: unless-stopped
+    ports:
+      - "2112:2112"
     depends_on:
       kafka:
         condition: service_healthy
@@ -148,9 +150,45 @@ services:
       KAFKA_TOPIC: "pg_cdc.public.products"
       KAFKA_GROUP_ID: "es-products-sync-group"
       ELASTICSEARCH_URL: "http://elasticsearch:9200"
-      ELASTICSEARCH_INDEX: "products"
+      ELASTICSEARCH_INDEX: "products_v1"
+      ELASTICSEARCH_SEARCH_ALIAS: "products_search_alias"
       BATCH_SIZE: 500
       FLUSH_INTERVAL_MS: 200
+      METRICS_ADDR: ":2112"
+    networks:
+      - cdc_network
+
+  # ---------------------------------------------------------------------------
+  # 6. Kafka Exporter (Consumer Lag & Offset Monitoring)
+  # ---------------------------------------------------------------------------
+  kafka_exporter:
+    image: danielqsj/kafka-exporter:latest
+    container_name: cdc_kafka_exporter
+    restart: unless-stopped
+    command:
+      - "--kafka.servers=kafka:9092"
+    ports:
+      - "9308:9308"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - cdc_network
+
+  # ---------------------------------------------------------------------------
+  # 7. Prometheus (Observability & Metrics Dashboard Backend)
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: cdc_prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - sync_worker
+      - kafka_exporter
     networks:
       - cdc_network
 

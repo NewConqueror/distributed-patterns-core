@@ -11,6 +11,7 @@ import (
 	"Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium/internal/circuitbreaker"
 	"Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium/internal/config"
 	"Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium/internal/dlq"
+	"Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium/internal/metrics"
 	"Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium/internal/transformer"
 )
 
@@ -84,6 +85,9 @@ func (c *Consumer) Start(ctx context.Context) error {
 				// Permanent Poison Pill detected: Send to DLQ and advance offset to avoid pipeline deadlock
 				log.Printf("[Poison Pill] Malformed CDC message detected (Partition: %d, Offset: %d): %v",
 					msg.Partition, msg.Offset, err)
+
+				metrics.RecordEventConsumed("failure")
+				metrics.RecordDLQEvent(dlq.ErrorTypeMalformedJSON)
 
 				if dlqErr := c.dlqProducer.Publish(ctx, msg, dlq.ErrorTypeMalformedJSON, err.Error()); dlqErr != nil {
 					log.Printf("[DLQ Error] Failed to publish poison message to DLQ: %v", dlqErr)

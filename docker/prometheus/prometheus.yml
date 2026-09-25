@@ -1,0 +1,18 @@
+global:
+  scrape_interval: 2s
+  evaluation_interval: 2s
+
+scrape_configs:
+  # 1. Go CDC Sync Worker (E2E Latency, Event Count, Batch Size, DLQ, Circuit Breaker)
+  - job_name: 'go-sync-worker'
+    static_configs:
+      - targets: ['sync_worker:2112']
+        labels:
+          pipeline: 'pg_to_es_cdc'
+
+  # 2. Kafka Exporter (Consumer Group Lag, Topic Offsets)
+  - job_name: 'kafka-exporter'
+    static_configs:
+      - targets: ['kafka_exporter:9308']
+        labels:
+          cluster: 'cdc_kafka_kraft'
