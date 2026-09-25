@@ -129,6 +129,31 @@ services:
     networks:
       - cdc_network
 
+  # ---------------------------------------------------------------------------
+  # 5. Go Sync Worker (CDC Transformer & Micro-Batching ES Syncer)
+  # ---------------------------------------------------------------------------
+  sync_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cdc_sync_worker
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_TOPIC: "pg_cdc.public.products"
+      KAFKA_GROUP_ID: "es-products-sync-group"
+      ELASTICSEARCH_URL: "http://elasticsearch:9200"
+      ELASTICSEARCH_INDEX: "products"
+      BATCH_SIZE: 500
+      FLUSH_INTERVAL_MS: 200
+    networks:
+      - cdc_network
+
 # -----------------------------------------------------------------------------
 # Persistent Volumes (Kalıcı Veri & Offset Koruması)
 # -----------------------------------------------------------------------------

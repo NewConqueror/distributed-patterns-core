@@ -147,3 +147,43 @@ docker-compose ps
 ./scripts/test-crud-events.sh
 ```
 
+---
+
+## Faz 3: Go Sync Worker (Transformer & Pipeline)
+
+### 3.1. Go Proje İskeleti ve Kafka Consumer Setup
+- **Kütüphane:** `segmentio/kafka-go` (Pure Go, CGO/librdkafka bağımsızlığı)
+- **Consumer Group:** `es-products-sync-group` (Yatayda çoklu worker ile otomatik rebalance ve ölçekleme)
+- **Manuel Commit (At-Least-Once Delivery):** Otomatik commit (`enable.auto.commit`) kapatılmıştır (`CommitInterval: 0`). Offset'ler yalnızca Elasticsearch'e `_bulk` isteği başarıyla tamamlandıktan sonra topluca commit edilir.
+
+### 3.2. Debezium Event Transformer & Data Flattening
+- **Go Modelleri:** `DebeziumEnvelope[ProductRaw]` ve `ProductSearchDocument`.
+- **Denormalizasyon:** `category_id (INT)` ilişkisel alanı, bellek içi önbellekten (`CategoryCache`) çekilerek `category_name` metni olarak dokümana düzleştirilir (flattening).
+- **İşlem Ayrıştırması:**
+  - `op == "d"` ve tombstones -> Elasticsearch `delete` operasyonu.
+  - `op == "c" || op == "u" || op == "r"` -> Elasticsearch `index` (upsert) operasyonu.
+
+### 3.3. Mikro-Batching ve Elasticsearch Bulk API Entegrasyonu
+- **Çift Tetikleyicili Tampon (Dual-Trigger Batching):**
+  - **Boyut Tetikleyici:** 500 mesaj toplandığında anında flush.
+  - **Zaman Tetikleyici:** 200 milisaniye dolduğunda `time.Ticker` ile otomatik flush.
+- **NDJSON Bulk Format:** Tek tek HTTP istekleri yerine tek bir HTTP POST ile Elasticsearch `/_bulk` NDJSON akışı.
+- **External Versioning Koruması:** `version_type=external_gte` ve `version=db_version` kullanılarak Kafka'dan gecikmeli/eski gelen mesajların Elasticsearch'teki güncel dokümanı ezmesi engellenir.
+
+### 3.4. Çalıştırma ve Doğrulama
+
+```bash
+# Birim testleri çalıştırın
+go test -v ./...
+
+# Go Sync Worker'ı başlatın (Host üzerinde)
+go run ./cmd/sync-worker
+
+# Veya Docker Compose üzerinden tüm pipeline'ı ayağa kaldırın
+docker-compose up -d --build
+
+# Elasticsearch indeksindeki dokümanları ve senkronizasyon durumunu doğrulayın
+./scripts/verify-phase3-search.sh
+```
+
+
