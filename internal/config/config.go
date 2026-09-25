@@ -20,6 +20,13 @@ type Config struct {
 	// Micro-batching & Buffering
 	BatchSize     int
 	FlushInterval time.Duration
+
+	// DLQ (Dead Letter Queue)
+	DLQTopic string
+
+	// Circuit Breaker & Backoff
+	CBInitialBackoff time.Duration
+	CBMaxBackoff     time.Duration
 }
 
 func LoadConfig() *Config {
@@ -31,6 +38,9 @@ func LoadConfig() *Config {
 		ElasticsearchIndex: getEnv("ELASTICSEARCH_INDEX", "products"),
 		BatchSize:          getEnvInt("BATCH_SIZE", 500),
 		FlushInterval:      time.Duration(getEnvInt("FLUSH_INTERVAL_MS", 200)) * time.Millisecond,
+		DLQTopic:           getEnv("DLQ_TOPIC", "cdc.products.dlq"),
+		CBInitialBackoff:   time.Duration(getEnvInt("CB_INITIAL_BACKOFF_SEC", 1)) * time.Second,
+		CBMaxBackoff:       time.Duration(getEnvInt("CB_MAX_BACKOFF_SEC", 16)) * time.Second,
 	}
 }
 

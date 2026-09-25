@@ -8,6 +8,8 @@ import (
 
 	"github.com/segmentio/kafka-go"
 
+	"Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium/internal/circuitbreaker"
+	"Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium/internal/dlq"
 	"Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium/internal/elasticsearch"
 	"Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium/internal/model"
 )
@@ -17,6 +19,8 @@ type Batcher struct {
 	flushInterval time.Duration
 	esClient      *elasticsearch.Client
 	kafkaReader   *kafka.Reader
+	dlqProducer   dlq.Producer
+	cb            *circuitbreaker.CircuitBreaker
 
 	itemChan chan model.BulkItem
 	mu       sync.Mutex
@@ -28,12 +32,16 @@ func NewBatcher(
 	flushInterval time.Duration,
 	esClient *elasticsearch.Client,
 	kafkaReader *kafka.Reader,
+	dlqProducer dlq.Producer,
+	cb *circuitbreaker.CircuitBreaker,
 ) *Batcher {
 	return &Batcher{
 		batchSize:     batchSize,
 		flushInterval: flushInterval,
 		esClient:      esClient,
 		kafkaReader:   kafkaReader,
+		dlqProducer:   dlqProducer,
+		cb:            cb,
 		itemChan:      make(chan model.BulkItem, batchSize*2),
 		buffer:        make([]model.BulkItem, 0, batchSize),
 	}
@@ -60,7 +68,6 @@ func (b *Batcher) Start(ctx context.Context) error {
 
 		case item, ok := <-b.itemChan:
 			if !ok {
-				// Channel closed
 				b.flush(context.Background())
 				return nil
 			}
@@ -84,6 +91,11 @@ func (b *Batcher) Start(ctx context.Context) error {
 	}
 }
 
+// FlushPublic allows external callers (such as graceful shutdown) to force an immediate flush
+func (b *Batcher) FlushPublic(ctx context.Context) error {
+	return b.flush(ctx)
+}
+
 // flush sends accumulated items to Elasticsearch /_bulk and commits Kafka offsets on success
 func (b *Batcher) flush(ctx context.Context) error {
 	b.mu.Lock()
@@ -94,16 +106,19 @@ func (b *Batcher) flush(ctx context.Context) error {
 		return nil
 	}
 
+	// 0. Wait if Circuit Breaker is OPEN due to ongoing Elasticsearch outage
+	if err := b.cb.WaitIfOpen(ctx); err != nil {
+		return err
+	}
+
 	itemsToFlush := b.buffer
 	b.buffer = make([]model.BulkItem, 0, b.batchSize)
 
-	// Filter out tombstones that have no document to delete (empty version/id) if any
 	var validBulkItems []model.BulkItem
 	var kafkaMsgs []kafka.Message
 
 	for _, item := range itemsToFlush {
 		kafkaMsgs = append(kafkaMsgs, item.KafkaMsg)
-		// Only send to ES if it's not a redundant empty tombstone
 		if item.IsTombstone && item.ID == "" {
 			continue
 		}
@@ -121,20 +136,36 @@ func (b *Batcher) flush(ctx context.Context) error {
 			return err
 		}
 
-		resp, err := b.esClient.Bulk(ctx, ndjson)
+		bulkResult, err := b.esClient.Bulk(ctx, ndjson)
 		if err != nil {
-			// Do NOT commit Kafka messages; put items back
+			// Handle Transient Errors -> Trip Circuit Breaker
+			if elasticsearch.IsTransient(err) {
+				b.cb.Trip(err)
+			}
+			// Do NOT commit Kafka messages; restore buffer
 			b.buffer = append(itemsToFlush, b.buffer...)
 			return err
 		}
 
 		elapsed := time.Since(start)
-		log.Printf("[ES Bulk Success] Indexed/Deleted %d documents in %v (ES Took: %dms, HasErrors: %v)",
-			len(validBulkItems), elapsed, resp.Took, resp.Errors)
+		log.Printf("[ES Bulk Success] Processed %d documents in %v (ES Took: %dms, HasErrors: %v)",
+			len(validBulkItems), elapsed, bulkResult.Response.Took, bulkResult.Response.Errors)
+
+		// 2. Handle Permanent Item Failures (Route to DLQ)
+		if len(bulkResult.PermanentMap) > 0 {
+			log.Printf("[DLQ Notice] Routing %d permanently failed items to DLQ...", len(bulkResult.PermanentMap))
+			for _, item := range validBulkItems {
+				if reason, isFailed := bulkResult.PermanentMap[item.ID]; isFailed {
+					if dlqErr := b.dlqProducer.Publish(ctx, item.KafkaMsg, dlq.ErrorTypeMappingConflict, reason); dlqErr != nil {
+						log.Printf("[DLQ Error] Failed to publish message %s to DLQ: %v", item.ID, dlqErr)
+					}
+				}
+			}
+		}
 	}
 
-	// 2. Manual Commit to Kafka (At-Least-Once Delivery Guarantee)
-	// Kafka messages are only committed AFTER Elasticsearch has accepted the batch!
+	// 3. Manual Commit to Kafka (At-Least-Once Delivery Guarantee)
+	// We commit the offsets of ALL processed items (including items sent to DLQ to advance the offset)
 	if len(kafkaMsgs) > 0 {
 		commitStart := time.Now()
 		if err := b.kafkaReader.CommitMessages(ctx, kafkaMsgs...); err != nil {

@@ -8,7 +8,9 @@ import (
 
 	"github.com/segmentio/kafka-go"
 
+	"Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium/internal/circuitbreaker"
 	"Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium/internal/config"
+	"Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium/internal/dlq"
 	"Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium/internal/transformer"
 )
 
@@ -16,6 +18,8 @@ type Consumer struct {
 	reader      *kafka.Reader
 	transformer *transformer.Transformer
 	batcher     *Batcher
+	dlqProducer dlq.Producer
+	cb          *circuitbreaker.CircuitBreaker
 }
 
 func NewConsumer(
@@ -23,11 +27,15 @@ func NewConsumer(
 	transformer *transformer.Transformer,
 	batcher *Batcher,
 	reader *kafka.Reader,
+	dlqProducer dlq.Producer,
+	cb *circuitbreaker.CircuitBreaker,
 ) *Consumer {
 	return &Consumer{
 		reader:      reader,
 		transformer: transformer,
 		batcher:     batcher,
+		dlqProducer: dlqProducer,
+		cb:          cb,
 	}
 }
 
@@ -55,7 +63,12 @@ func (c *Consumer) Start(ctx context.Context) error {
 			log.Println("[Kafka Consumer] Context cancelled, shutting down fetch loop...")
 			return nil
 		default:
-			// FetchMessage retrieves the next message WITHOUT auto-committing the offset
+			// 1. Circuit Breaker Guard: If Elasticsearch is down/unhealthy, pause consumer fetch loop
+			if err := c.cb.WaitIfOpen(ctx); err != nil {
+				return nil
+			}
+
+			// 2. FetchMessage retrieves the next message WITHOUT auto-committing the offset
 			msg, err := c.reader.FetchMessage(ctx)
 			if err != nil {
 				if errors.Is(err, context.Canceled) || errors.Is(err, io.EOF) {
@@ -65,17 +78,25 @@ func (c *Consumer) Start(ctx context.Context) error {
 				continue
 			}
 
-			// Transform Debezium event into Elasticsearch BulkItem
+			// 3. Transform Debezium event into Elasticsearch BulkItem
 			bulkItem, err := c.transformer.Transform(msg)
 			if err != nil {
-				log.Printf("[Transform Warning] Skipping malformed message (Partition: %d, Offset: %d): %v",
+				// Permanent Poison Pill detected: Send to DLQ and advance offset to avoid pipeline deadlock
+				log.Printf("[Poison Pill] Malformed CDC message detected (Partition: %d, Offset: %d): %v",
 					msg.Partition, msg.Offset, err)
-				// Still commit skipped messages to avoid poisonous message loops
-				_ = c.reader.CommitMessages(ctx, msg)
+
+				if dlqErr := c.dlqProducer.Publish(ctx, msg, dlq.ErrorTypeMalformedJSON, err.Error()); dlqErr != nil {
+					log.Printf("[DLQ Error] Failed to publish poison message to DLQ: %v", dlqErr)
+				}
+
+				// Crucial: Commit offset so the consumer does not crash-loop on the bad message!
+				if commitErr := c.reader.CommitMessages(ctx, msg); commitErr != nil {
+					log.Printf("[Commit Warning] Failed to commit poison pill offset: %v", commitErr)
+				}
 				continue
 			}
 
-			// Push to micro-batching buffer
+			// 4. Push to micro-batching buffer
 			c.batcher.Push(*bulkItem)
 		}
 	}

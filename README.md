@@ -186,4 +186,35 @@ docker-compose up -d --build
 ./scripts/verify-phase3-search.sh
 ```
 
+---
+
+## Faz 4: Dayanıklılık, Hata İzolasyonu ve İyileştirme
+
+### 4.1. Dead Letter Queue (DLQ) ve Zehirli Mesaj Yönetimi
+- **Hata Sınıflandırma:**
+  - **Geçici Hatalar (Transient):** Ağ hatası, timeout, HTTP 5xx -> DLQ'ya gönderilmez; Circuit Breaker açılır ve exponential backoff ile beklenir.
+  - **Kalıcı Hatalar (Permanent):** Bozuk JSON, geçersiz tipler, Elasticsearch 400 Bad Request / mapping uyuşmazlığı -> `cdc.products.dlq` topic'ine yönlendirilir.
+- **Teşhis Başlıkları (Diagnostic Headers):** `x-error-type`, `x-error-reason`, `x-original-topic`, `x-original-partition`, `x-original-offset`, `x-failed-at`.
+- **Non-Blocking Offset İlerlemesi:** Zehirli mesaj DLQ'ya kaydedildikten sonra ana Kafka offset'i commit edilir; worker kilitlenmeden akışına devam eder.
+
+### 4.2. Circuit Breaker ve Backoff Stratejisi
+- **Elasticsearch Sağlık Takibi:** ES 5xx veya bağlantı kopması durumunda devre `OPEN` konumuna geçer ve consumer tüketimi duraklatılır (pause).
+- **Exponential Backoff:** Arka planda `1s, 2s, 4s, 8s, 16s...` aralıklarla `/_cluster/health` uç noktası yoklanır.
+- **Otomatik Resume:** Küme tekrar `green` veya `yellow` durumuna geldiğinde devre `CLOSED` olur ve tüketim kaldığı yerden otomatik olarak devam eder.
+
+### 4.3. Graceful Shutdown
+- `SIGINT` ve `SIGTERM` sinyalleri yakalanarak consumer okuması anında kesilir.
+- Tamponda bekleyen son olaylar derhal Elasticsearch'e bulk edilir ve son offset'ler commit edildikten sonra temiz kapanma sağlanır.
+
+### 4.4. Test ve Doğrulama
+
+```bash
+# Zehirli mesaj simülasyonunu çalıştırın
+./scripts/test-poison-pill.sh
+
+# DLQ topic'ini başlıklarıyla birlikte izleyin
+./scripts/kafka/consume-dlq.sh
+```
+
+
 
