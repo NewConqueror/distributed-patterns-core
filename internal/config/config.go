@@ -14,8 +14,9 @@ type Config struct {
 	KafkaGroupID string
 
 	// Elasticsearch
-	ElasticsearchURL   string
-	ElasticsearchIndex string
+	ElasticsearchURL         string
+	ElasticsearchIndex       string
+	ElasticsearchSearchAlias string
 
 	// Micro-batching & Buffering
 	BatchSize     int
@@ -31,16 +32,17 @@ type Config struct {
 
 func LoadConfig() *Config {
 	return &Config{
-		KafkaBrokers:       getEnvSlice("KAFKA_BROKERS", []string{"localhost:9092"}),
-		KafkaTopic:         getEnv("KAFKA_TOPIC", "pg_cdc.public.products"),
-		KafkaGroupID:       getEnv("KAFKA_GROUP_ID", "es-products-sync-group"),
-		ElasticsearchURL:   getEnv("ELASTICSEARCH_URL", "http://localhost:9200"),
-		ElasticsearchIndex: getEnv("ELASTICSEARCH_INDEX", "products"),
-		BatchSize:          getEnvInt("BATCH_SIZE", 500),
-		FlushInterval:      time.Duration(getEnvInt("FLUSH_INTERVAL_MS", 200)) * time.Millisecond,
-		DLQTopic:           getEnv("DLQ_TOPIC", "cdc.products.dlq"),
-		CBInitialBackoff:   time.Duration(getEnvInt("CB_INITIAL_BACKOFF_SEC", 1)) * time.Second,
-		CBMaxBackoff:       time.Duration(getEnvInt("CB_MAX_BACKOFF_SEC", 16)) * time.Second,
+		KafkaBrokers:             getEnvSlice("KAFKA_BROKERS", []string{"localhost:9092"}),
+		KafkaTopic:               getEnv("KAFKA_TOPIC", "pg_cdc.public.products"),
+		KafkaGroupID:             getEnv("KAFKA_GROUP_ID", "es-products-sync-group"),
+		ElasticsearchURL:         getEnv("ELASTICSEARCH_URL", "http://localhost:9200"),
+		ElasticsearchIndex:       getEnv("ELASTICSEARCH_INDEX", "products_v1"),
+		ElasticsearchSearchAlias: getEnv("ELASTICSEARCH_SEARCH_ALIAS", "products_search_alias"),
+		BatchSize:                getEnvInt("BATCH_SIZE", 500),
+		FlushInterval:            time.Duration(getEnvInt("FLUSH_INTERVAL_MS", 200)) * time.Millisecond,
+		DLQTopic:                 getEnv("DLQ_TOPIC", "cdc.products.dlq"),
+		CBInitialBackoff:         time.Duration(getEnvInt("CB_INITIAL_BACKOFF_SEC", 1)) * time.Second,
+		CBMaxBackoff:             time.Duration(getEnvInt("CB_MAX_BACKOFF_SEC", 16)) * time.Second,
 	}
 }
 

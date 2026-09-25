@@ -216,5 +216,32 @@ docker-compose up -d --build
 ./scripts/kafka/consume-dlq.sh
 ```
 
+---
+
+## Faz 5: Re-indexing ve Initial Snapshot Senkronizasyonu
+
+### 5.1. İlk Yükleme (Initial Snapshotting) ve Watermarking
+- **`snapshot.mode: initial`:** Mevcut tüm PostgreSQL kayıtları `op: "r"` ve `source.snapshot: "true"` bayraklarıyla tutarlı bir transaction snapshot'ı olarak okunur.
+- **Watermark & LSN Senkronizasyonu:** Snapshot anında PostgreSQL'deki High Watermark LSN kaydedilir; snapshot bittiğinde kesintisiz streaming moda (`op: "c"`, `"u"`, `"d"`) geçilir.
+
+### 5.2. Zero-Downtime Re-indexing ve Alias Mimarisi
+- **Search Alias:** Uygulamalar ve arama sorguları somut indeks (`products_v1`) yerine `products_search_alias` takma adına bağlanır.
+- **Sinyal Tablosu (`debezium_signal`):** Canlı sistemi durdurmadan veya replikasyon slotunu silmeden, PostgreSQL'e basit bir `INSERT INTO debezium_signal` sorgusu atılarak seçili tablolar için ad-hoc/incremental snapshot tetiklenir.
+- **Atomic Alias Switch:** Yeni indeks (`products_v2`) hazır olduğunda `POST /_aliases` üzerinden sıfır kesintiyle (zero-downtime) takma ad yeni indekse taşınır.
+
+### 5.3. Test ve Doğrulama
+
+```bash
+# Canlı sisteme dokunmadan incremental snapshot tetikleyin
+./scripts/trigger-incremental-snapshot.sh public.products
+
+# Atomic alias değişimini gerçekleştirin (products_v1 -> products_v2)
+./scripts/es/switch-alias.sh products_v1 products_v2 products_search_alias
+
+# Re-indexing ve alias durumunu doğrulayın
+./scripts/verify-phase5-reindex.sh
+```
+
+
 
 

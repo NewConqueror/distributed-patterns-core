@@ -30,13 +30,22 @@ CREATE TABLE IF NOT EXISTS products (
 -- ========================================================================
 ALTER TABLE products REPLICA IDENTITY FULL;
 
--- Debezium için Logical Replication Publication Tanımlaması
--- Kısıtlı cdc_user süper kullanıcı olmadığı için publication'ı önceden 
--- oluşturup cdc_user'a okuma/kullanım hakkı vermek en güvenli yöntemdir.
-CREATE PUBLICATION dbz_publication FOR TABLE products;
+-- ========================================================================
+-- Debezium Signaling Table (Canlı / Ad-Hoc Incremental Snapshot İçin)
+-- ========================================================================
+CREATE TABLE IF NOT EXISTS debezium_signal (
+    id VARCHAR(64) PRIMARY KEY,
+    type VARCHAR(32) NOT NULL,
+    data VARCHAR(2048) NULL
+);
 
--- cdc_user'a products tablosu için yetkileri pekiştir
+-- Debezium için Logical Replication Publication Tanımlaması
+-- products ve debezium_signal tablolarını yayına açar
+CREATE PUBLICATION dbz_publication FOR TABLE products, debezium_signal;
+
+-- cdc_user'a gerekli yetkileri ver
 GRANT SELECT ON TABLE products TO cdc_user;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE debezium_signal TO cdc_user;
 
 -- Örnek Seed Verileri (Başlangıç testleri için)
 INSERT INTO products (id, title, description, price, category_id, status, version)

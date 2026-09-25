@@ -164,6 +164,91 @@ func (c *Client) EnsureIndex(ctx context.Context, indexName string) error {
 	return nil
 }
 
+// EnsureIndexWithAlias creates the concrete index (e.g. products_v1) and binds a search alias (e.g. products_search_alias)
+func (c *Client) EnsureIndexWithAlias(ctx context.Context, indexName string, aliasName string) error {
+	if err := c.EnsureIndex(ctx, indexName); err != nil {
+		return err
+	}
+
+	if aliasName == "" {
+		return nil
+	}
+
+	// Check if alias already exists
+	aliasReq, err := http.NewRequestWithContext(ctx, http.MethodHead, fmt.Sprintf("%s/_alias/%s", c.baseURL, aliasName), nil)
+	if err != nil {
+		return err
+	}
+	aliasResp, err := c.httpClient.Do(aliasReq)
+	if err != nil {
+		return &TransientError{Cause: err, Message: "error checking alias"}
+	}
+	defer aliasResp.Body.Close()
+
+	if aliasResp.StatusCode == http.StatusOK {
+		return nil // Alias already exists
+	}
+
+	// Bind alias to indexName
+	aliasPayload := fmt.Sprintf(`{
+		"actions": [
+			{ "add": { "index": "%s", "alias": "%s" } }
+		]
+	}`, indexName, aliasName)
+
+	putReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/_aliases", bytes.NewBufferString(aliasPayload))
+	if err != nil {
+		return err
+	}
+	putReq.Header.Set("Content-Type", "application/json")
+
+	putResp, err := c.httpClient.Do(putReq)
+	if err != nil {
+		return &TransientError{Cause: err, Message: "error creating alias"}
+	}
+	defer putResp.Body.Close()
+
+	if putResp.StatusCode >= 400 {
+		b, _ := io.ReadAll(putResp.Body)
+		return fmt.Errorf("failed to bind alias %s to %s (status %d): %s", aliasName, indexName, putResp.StatusCode, string(b))
+	}
+
+	log.Printf("[Elasticsearch] Alias '%s' -> Index '%s' established successfully", aliasName, indexName)
+	return nil
+}
+
+// SwitchAlias performs an atomic swap of alias from oldIndex to newIndex with zero downtime
+func (c *Client) SwitchAlias(ctx context.Context, oldIndex, newIndex, aliasName string) error {
+	payload := fmt.Sprintf(`{
+		"actions": [
+			{ "remove": { "index": "%s", "alias": "%s" } },
+			{ "add":    { "index": "%s", "alias": "%s" } }
+		]
+	}`, oldIndex, aliasName, newIndex, aliasName)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/_aliases", bytes.NewBufferString(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return &TransientError{Cause: err, Message: "network error during atomic alias switch"}
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("failed atomic alias switch from %s to %s for alias %s (status %d): %s",
+			oldIndex, newIndex, aliasName, resp.StatusCode, string(body))
+	}
+
+	log.Printf("[Elasticsearch Zero-Downtime] Atomic alias switch completed: '%s' moved from '%s' -> '%s'",
+		aliasName, oldIndex, newIndex)
+	return nil
+}
+
 // BulkResult holds the overall response and specific failed items (e.g. mapping mismatch)
 type BulkResult struct {
 	Response     *model.BulkResponse

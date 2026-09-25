@@ -35,8 +35,8 @@ func main() {
 		log.Println("[Elasticsearch] Connected successfully.")
 	}
 
-	if err := esClient.EnsureIndex(context.Background(), cfg.ElasticsearchIndex); err != nil {
-		log.Printf("[Warning] Could not ensure index '%s': %v", cfg.ElasticsearchIndex, err)
+	if err := esClient.EnsureIndexWithAlias(context.Background(), cfg.ElasticsearchIndex, cfg.ElasticsearchSearchAlias); err != nil {
+		log.Printf("[Warning] Could not ensure index '%s' with alias '%s': %v", cfg.ElasticsearchIndex, cfg.ElasticsearchSearchAlias, err)
 	}
 
 	// 2. Circuit Breaker Setup for Elasticsearch Health Tracking
