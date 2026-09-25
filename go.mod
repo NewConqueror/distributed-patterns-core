@@ -1,0 +1,3 @@
+module Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezium
+
+go 1.22.2

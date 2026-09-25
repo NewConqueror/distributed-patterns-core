@@ -1,0 +1,25 @@
+{
+  "name": "inventory-postgres-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "cdc_user",
+    "database.password": "cdc_secure_pass_2026",
+    "database.dbname": "inventory_db",
+    "topic.prefix": "pg_cdc",
+    "table.include.list": "public.products",
+    "plugin.name": "pgoutput",
+    "slot.name": "debezium_cdc_slot",
+    "publication.name": "dbz_publication",
+    "publication.autocreate.mode": "filtered",
+    "decimal.handling.mode": "double",
+    "time.precision.mode": "connect",
+    "tombstones.on.delete": "false",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false"
+  }
+}
