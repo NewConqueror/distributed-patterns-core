@@ -3,6 +3,7 @@ module Real-Time_CDCPipeline_SyncingPostgreSQL_WALtoElasticsearch_viaKafkaDebezi
 go 1.22
 
 require (
+	github.com/lib/pq v1.12.3
 	github.com/prometheus/client_golang v1.19.0
 	github.com/segmentio/kafka-go v0.4.47
 )
