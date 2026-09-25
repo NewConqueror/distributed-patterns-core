@@ -103,7 +103,47 @@ docker-compose ps
 ./scripts/verify-phase1.sh
 ```
 
-#### 4. Debezium Connector'ı Kaydetme
+#### 4. Debezium Connector'ı Kaydetme ve Yönetme
 ```bash
-./scripts/debezium/register-connector.sh
+# Raw JSON moduyla kaydet (schemas.enable=false - önerilen)
+./scripts/debezium/manage-connector.sh register
+
+# Connector durumunu sorgula
+./scripts/debezium/manage-connector.sh status
 ```
+
+---
+
+## Faz 2: Debezium Connector, Topoloji ve Event Yakalama
+
+### 2.1. Connector Yapılandırması ve Parametreler
+- **Slot Adı:** `debezium_products_slot` (Statik slot ile yetim slot oluşumu engellenir)
+- **Plugin:** `pgoutput` (PostgreSQL 10+ standart decodig eklentisi, harici plugin gerektirmez)
+- **Tablo Filtresi:** `public.products` (Yalnızca arama motoruna akacak tablolar filtrelenir)
+- **Topic Prefix:** `pg_cdc` -> Kafka topic adı: `pg_cdc.public.products`
+
+### 2.2. Serileştirme ve Tombstone Yönetimi
+- **JSON Converter:** `schemas.enable=false` (Ağ ve bellek tasarrufu sağlayan ham veri modeli)
+- **Tombstone (`tombstones.on.delete=true`):**
+  - Satır silindiğinde önce `op: "d"` DELETE olayı fırlatılır (ES'ten silme işlemi için).
+  - Hemen ardından `key: {"id": ...}, value: null` tombstone mesajı iletilir (Kafka log cleaner compaction temizliği için).
+
+### 2.3. Topic Mimarisi ve Partition Stratejisi
+- **Key Dağıtımı:** Primary Key (`id` UUID) Kafka mesaj key'i olarak kullanılır.
+- **In-Order Processing:** `hash(key) % partition_count` sayesinde aynı ürünün tüm snapshot, create, update ve delete hareketleri **aynı partition'a** gider ve FIFO sırası bozulmaz.
+- **Event `op` Kodları:**
+  - `"r"`: Snapshot (ilk açılışta var olan veriler)
+  - `"c"`: Create (INSERT)
+  - `"u"`: Update (Önceki ve yeni halini içerir)
+  - `"d"`: Delete (Silinmeden önceki halini içerir)
+
+### 2.4. Test ve İzleme Komutları
+
+```bash
+# 1. Kafka topic'ini partition, key ve op payload'ları ile canlı izle
+./scripts/kafka/consume-products-topic.sh
+
+# 2. PostgreSQL'de test olayları tetikle (INSERT -> UPDATE -> DELETE)
+./scripts/test-crud-events.sh
+```
+
