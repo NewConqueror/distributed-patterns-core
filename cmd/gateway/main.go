@@ -18,9 +18,12 @@ import (
 	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/internal/cache/pgvector"
 	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/internal/embedding"
 	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/internal/handler"
+	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/internal/mcp"
 	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/internal/orchestrator"
 	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/internal/provider"
+	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/internal/safetool"
 	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/internal/tokenguard"
+	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/pkg/tool"
 )
 
 func getEnv(key, defaultVal string) string {
@@ -60,7 +63,7 @@ func main() {
 	cacheThreshold := getEnvFloat("CACHE_DISTANCE_THRESHOLD", cache.DefaultMaxDistance) // 0.08 (~92% similarity)
 
 	log.Println("==================================================================")
-	log.Println(" AI Gateway: Faz 1 (Streaming & Fallbacks) + Faz 2 (Semantic Cache & Token Guard)")
+	log.Println(" AI Gateway: Faz 1 (Streaming) + Faz 2 (Cache) + Faz 3 (Safe Tools & MCP)")
 	log.Println("==================================================================")
 
 	// 1. Initialize Upstream LLM Providers
@@ -136,7 +139,98 @@ func main() {
 	})
 	tokenGuardMiddleware := tokenguard.NewMiddleware(rateLimiter)
 
-	// 7. Register HTTP Handlers
+	// 7. Initialize Safe Tool Execution Engine & Policy Engine
+	toolRegistry := tool.NewRegistry()
+
+	// Register sample safe tools
+	_ = toolRegistry.Register(tool.Tool{
+		Definition: tool.Definition{
+			Name:        "fetch_order_status",
+			Description: "Safely fetches current order status by Order ID",
+			ReadOnly:    true,
+			Parameters: tool.JSONSchema{
+				Type:     tool.TypeObject,
+				Required: []string{"order_id"},
+				Properties: map[string]tool.JSONSchema{
+					"order_id": {Type: tool.TypeString, Description: "Unique order identifier (e.g. ORD-123)"},
+				},
+			},
+			RequiredPermissions: []string{"orders:read"},
+		},
+		Handler: func(ctx context.Context, args map[string]any) (any, error) {
+			orderID := args["order_id"].(string)
+			return map[string]any{
+				"order_id":   orderID,
+				"status":     "in_transit",
+				"updated_at": time.Now().UTC().Format(time.RFC3339),
+			}, nil
+		},
+	})
+
+	_ = toolRegistry.Register(tool.Tool{
+		Definition: tool.Definition{
+			Name:        "system_status",
+			Description: "Fetches AI Gateway system status and latency metrics",
+			ReadOnly:    true,
+			Parameters: tool.JSONSchema{
+				Type: tool.TypeObject,
+			},
+		},
+		Handler: func(ctx context.Context, args map[string]any) (any, error) {
+			return map[string]any{
+				"gateway_status": "healthy",
+				"uptime_seconds": 3600,
+			}, nil
+		},
+	})
+
+	safeExecutor := safetool.NewExecutor(safetool.ExecutorConfig{
+		Registry:    toolRegistry,
+		Policy:      safetool.NewPolicyEngine(),
+		AuditLogger: safetool.NewJSONAuditLogger(os.Stdout),
+		Timeout:     3 * time.Second,
+	})
+
+	// 8. Initialize Model Context Protocol (MCP) Server
+	resourceManager := mcp.NewResourceManager()
+	_ = resourceManager.Register(mcp.ResourceInfo{
+		URI:      "system://gateway_config",
+		Name:     "Gateway Configuration",
+		MimeType: "application/json",
+	}, func(ctx context.Context, uri string) (string, error) {
+		return fmt.Sprintf(`{"rate_limit_rpm":%d,"cache_distance_threshold":%.2f}`, maxRPM, cacheThreshold), nil
+	})
+
+	promptManager := mcp.NewPromptManager()
+	_ = promptManager.Register(mcp.PromptInfo{
+		Name:        "order_inquiry",
+		Description: "Template for customer order status inquiry",
+		Arguments: []mcp.PromptArgument{
+			{Name: "customer_name", Required: true},
+			{Name: "order_id", Required: true},
+		},
+	}, func(ctx context.Context, args map[string]string) ([]mcp.PromptMessage, error) {
+		return []mcp.PromptMessage{
+			{
+				Role: "user",
+				Content: mcp.ToolContent{
+					Type: "text",
+					Text: fmt.Sprintf("Hello, my name is %s. Could you check the status of my order %s?",
+						args["customer_name"], args["order_id"]),
+				},
+			},
+		}, nil
+	})
+
+	mcpServer := mcp.NewServer(mcp.ServerConfig{
+		Name:            "Production-AI-Gateway-MCP",
+		Version:         "1.0.0",
+		Executor:        safeExecutor,
+		ResourceManager: resourceManager,
+		PromptManager:   promptManager,
+	})
+
+	// 9. Register HTTP Routes
 	gatewayHandler := handler.NewGatewayHandlerWithConfig(handler.GatewayHandlerConfig{
 		Router:         router,
 		VectorStore:    vectorStore,
@@ -145,9 +239,14 @@ func main() {
 		AsyncWriter:    asyncWriter,
 		CacheThreshold: cacheThreshold,
 	})
+	toolHandler := handler.NewToolHandler(safeExecutor)
 
 	mux := http.NewServeMux()
 	mux.Handle("/v1/chat/completions", tokenGuardMiddleware.Handler(http.HandlerFunc(gatewayHandler.ChatCompletions)))
+	mux.HandleFunc("/v1/tools", toolHandler.ListTools)
+	mux.HandleFunc("/v1/tools/execute", toolHandler.ExecuteTool)
+	mux.HandleFunc("/mcp/rpc", mcpServer.ServeHTTP)
+	mux.HandleFunc("/mcp/sse", mcpServer.ServeSSE)
 	mux.HandleFunc("/health", gatewayHandler.HealthStatus)
 
 	server := &http.Server{
@@ -158,20 +257,18 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	// 8. Start HTTP Server
+	// 10. Start HTTP Server
 	go func() {
 		log.Printf("[Gateway] Server running on http://localhost:%s", port)
-		log.Printf("[Gateway] Rate Limits: %d RPM, %d TPM (Sliding Window)", maxRPM, maxTPM)
-		log.Printf("[Gateway] Semantic Cache: Max Cosine Distance %.2f (>= %.0f%% similarity)",
-			cacheThreshold, (1.0-cacheThreshold)*100)
-		log.Printf("[Gateway] Primary Provider: %s | Fallback: %s", primaryProvider.ID(), fallbackProvider.ID())
+		log.Printf("[Gateway] Tools & MCP: Registered %d tools, JSON-RPC at /mcp/rpc, SSE at /mcp/sse", len(toolRegistry.List()))
+		log.Printf("[Gateway] Endpoints: /v1/chat/completions, /v1/tools, /v1/tools/execute, /mcp/rpc, /mcp/sse, /health")
 
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("[Gateway] Server error: %v", err)
 		}
 	}()
 
-	// 9. Graceful Shutdown
+	// 11. Graceful Shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 	<-quit
