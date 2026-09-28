@@ -16,12 +16,16 @@ var (
 	ErrClientDisconnected = errors.New("client disconnected")
 )
 
+// ChunkInterceptor is called whenever a chunk is written to the SSE stream.
+type ChunkInterceptor func(chunk any)
+
 // Writer provides a clean abstraction for Server-Sent Events (SSE).
 type Writer struct {
-	w       http.ResponseWriter
-	flusher http.Flusher
-	ctx     context.Context
-	mu      sync.Mutex
+	w           http.ResponseWriter
+	flusher     http.Flusher
+	ctx         context.Context
+	interceptor ChunkInterceptor
+	mu          sync.Mutex
 }
 
 // Event defines the payload for an SSE message.
@@ -103,8 +107,23 @@ func (sw *Writer) WriteEvent(evt Event) error {
 	return nil
 }
 
+// SetInterceptor attaches an interceptor callback to inspect all chunks being streamed.
+func (sw *Writer) SetInterceptor(interceptor ChunkInterceptor) {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	sw.interceptor = interceptor
+}
+
 // WriteChunk writes a data-only SSE message (standard OpenAI format: "data: <json>\n\n").
 func (sw *Writer) WriteChunk(data any) error {
+	sw.mu.Lock()
+	fn := sw.interceptor
+	sw.mu.Unlock()
+
+	if fn != nil {
+		fn(data)
+	}
+
 	return sw.WriteEvent(Event{
 		Data: data,
 	})

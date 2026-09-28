@@ -5,21 +5,63 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strings"
+	"sync"
 
+	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/internal/cache"
+	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/internal/embedding"
 	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/internal/orchestrator"
 	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/pkg/models"
+	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/pkg/normalizer"
 	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/pkg/sse"
 )
 
-// GatewayHandler handles incoming API requests.
-type GatewayHandler struct {
-	router *orchestrator.Router
+// GatewayHandlerConfig configures the HTTP Gateway Handler.
+type GatewayHandlerConfig struct {
+	Router         *orchestrator.Router
+	VectorStore    cache.VectorStore
+	Embedder       embedding.Embedder
+	Replay         *cache.ReplayEngine
+	AsyncWriter    *cache.AsyncWriter
+	CacheThreshold float64 // Max cosine distance for hit (e.g. 0.08)
 }
 
-// NewGatewayHandler creates a new GatewayHandler.
+// GatewayHandler handles incoming API requests with semantic caching and fallback routing.
+type GatewayHandler struct {
+	router         *orchestrator.Router
+	vectorStore    cache.VectorStore
+	embedder       embedding.Embedder
+	replay         *cache.ReplayEngine
+	asyncWriter    *cache.AsyncWriter
+	cacheThreshold float64
+}
+
+// NewGatewayHandler creates a basic GatewayHandler without semantic caching.
 func NewGatewayHandler(router *orchestrator.Router) *GatewayHandler {
+	return NewGatewayHandlerWithConfig(GatewayHandlerConfig{
+		Router: router,
+	})
+}
+
+// NewGatewayHandlerWithConfig initializes GatewayHandler with semantic cache and replay capabilities.
+func NewGatewayHandlerWithConfig(cfg GatewayHandlerConfig) *GatewayHandler {
+	threshold := cfg.CacheThreshold
+	if threshold <= 0 {
+		threshold = cache.DefaultMaxDistance // 0.08
+	}
+
+	replay := cfg.Replay
+	if replay == nil {
+		replay = cache.NewReplayEngine(cache.ReplayConfig{})
+	}
+
 	return &GatewayHandler{
-		router: router,
+		router:         cfg.Router,
+		vectorStore:    cfg.VectorStore,
+		embedder:       cfg.Embedder,
+		replay:         replay,
+		asyncWriter:    cfg.AsyncWriter,
+		cacheThreshold: threshold,
 	}
 }
 
@@ -52,9 +94,49 @@ func (h *GatewayHandler) ChatCompletions(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Propagate request context (r.Context()). If client disconnects or aborts,
-	// r.Context().Done() fires immediately, stopping upstream streaming.
 	ctx := r.Context()
+
+	// 1. Semantic Cache Lookup (<50ms fast-path)
+	var promptText string
+	var promptEmbedding []float32
+
+	if h.vectorStore != nil && h.embedder != nil {
+		promptText = normalizer.ExtractPromptFromMessages(req.Messages)
+		if promptText != "" {
+			emb, err := h.embedder.Embed(ctx, promptText)
+			if err == nil && len(emb) > 0 {
+				promptEmbedding = emb
+				cachedItem, findErr := h.vectorStore.FindSimilar(ctx, emb, h.cacheThreshold)
+				if findErr == nil && cachedItem != nil {
+					// Cache HIT: Replay response immediately with simulated latency
+					w.Header().Set("X-Cache", "HIT")
+					if replayErr := h.replay.Replay(ctx, cachedItem, sseWriter); replayErr != nil {
+						log.Printf("[Gateway] Replay cache error: %v", replayErr)
+					}
+					return
+				}
+			}
+		}
+	}
+
+	// Cache MISS: Stream from upstream LLM models via Router
+	w.Header().Set("X-Cache", "MISS")
+
+	// Set up token accumulator to persist completed response to vector cache asynchronously
+	var collectedText strings.Builder
+	var mu sync.Mutex
+
+	if h.asyncWriter != nil && promptText != "" {
+		sseWriter.SetInterceptor(func(chunk any) {
+			if sc, ok := chunk.(models.StreamChunk); ok && sc.DeltaContent != "" {
+				mu.Lock()
+				collectedText.WriteString(sc.DeltaContent)
+				mu.Unlock()
+			}
+		})
+	}
+
+	// Propagate request context. If client disconnects, r.Context().Done() cancels upstream.
 	err = h.router.StreamResponse(ctx, req, sseWriter)
 	if err != nil {
 		if errors.Is(err, sse.ErrClientDisconnected) || errors.Is(ctx.Err(), http.ErrAbortHandler) {
@@ -62,6 +144,22 @@ func (h *GatewayHandler) ChatCompletions(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		log.Printf("[Gateway] Stream error: %v", err)
+		return
+	}
+
+	// 2. Asynchronously save successful completion to vector cache without blocking client
+	if h.asyncWriter != nil && promptText != "" {
+		finalResponse := collectedText.String()
+		if len(finalResponse) > 0 {
+			h.asyncWriter.Enqueue(&cache.WriteTask{
+				PromptText:   promptText,
+				Embedding:    promptEmbedding,
+				ResponseText: finalResponse,
+				Metadata: map[string]any{
+					"model": req.Model,
+				},
+			})
+		}
 	}
 }
 
