@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/internal/observability"
 	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/internal/provider"
 	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/pkg/models"
 	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/pkg/sse"
@@ -131,6 +132,7 @@ func (r *Router) StreamResponse(ctx context.Context, req models.CompletionReques
 			continue
 		}
 
+		observability.DefaultRegistry().FallbackTriggeredTotal.Inc(r.primaryProvider.ID(), fbProvider.ID(), "primary_unavailable")
 		err := r.attemptStream(ctx, fbProvider, fbCB, req, sseWriter)
 		if err == nil {
 			return nil
@@ -160,6 +162,7 @@ func (r *Router) attemptStream(
 	req models.CompletionRequest,
 	sseWriter *sse.Writer,
 ) error {
+	streamStart := time.Now()
 	chunkChan, errChan := p.Stream(ctx, req)
 
 	tokensEmitted := 0
@@ -178,11 +181,16 @@ func (r *Router) attemptStream(
 					select {
 					case chunk, ok := <-chunkChan:
 						if ok {
+							if tokensEmitted == 0 {
+								ttft := time.Since(streamStart).Seconds()
+								observability.DefaultRegistry().LLMTimeToFirstTokenSeconds.Observe(ttft, p.ID(), req.Model, "false")
+							}
 							if writeErr := sseWriter.WriteChunk(chunk); writeErr != nil {
 								return writeErr
 							}
 							tokensEmitted++
 							partialContent += chunk.DeltaContent
+							observability.DefaultRegistry().LLMTokensGeneratedTotal.Inc(p.ID(), req.Model)
 							continue
 						}
 					default:
@@ -208,6 +216,15 @@ func (r *Router) attemptStream(
 				return sseWriter.WriteDone()
 			}
 
+			// Record Time To First Token (TTFT) on first chunk
+			if tokensEmitted == 0 {
+				ttft := time.Since(streamStart).Seconds()
+				observability.DefaultRegistry().LLMTimeToFirstTokenSeconds.Observe(ttft, p.ID(), req.Model, "false")
+				if span := observability.SpanFromContext(ctx); span != nil {
+					span.AddEvent("first_token", map[string]any{"ttft_ms": ttft * 1000, "provider": p.ID()})
+				}
+			}
+
 			// Write token chunk to SSE client
 			if err := sseWriter.WriteChunk(chunk); err != nil {
 				return err
@@ -215,6 +232,7 @@ func (r *Router) attemptStream(
 
 			tokensEmitted++
 			partialContent += chunk.DeltaContent
+			observability.DefaultRegistry().LLMTokensGeneratedTotal.Inc(p.ID(), req.Model)
 		}
 	}
 }

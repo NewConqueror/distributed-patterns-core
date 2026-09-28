@@ -19,6 +19,7 @@ import (
 	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/internal/embedding"
 	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/internal/handler"
 	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/internal/mcp"
+	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/internal/observability"
 	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/internal/orchestrator"
 	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/internal/provider"
 	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/internal/safetool"
@@ -248,6 +249,11 @@ func main() {
 	mux.HandleFunc("/mcp/rpc", mcpServer.ServeHTTP)
 	mux.HandleFunc("/mcp/sse", mcpServer.ServeSSE)
 	mux.HandleFunc("/health", gatewayHandler.HealthStatus)
+
+	// Observability & Profiling endpoints
+	mux.Handle("/metrics", observability.DefaultRegistry().Handler())
+	mux.Handle("/v1/traces", observability.DefaultTracer().TracesHandler())
+	observability.RegisterProfilingRoutes(mux)
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%s", port),

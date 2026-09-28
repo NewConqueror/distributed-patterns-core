@@ -7,9 +7,11 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/internal/cache"
 	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/internal/embedding"
+	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/internal/observability"
 	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/internal/orchestrator"
 	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/pkg/models"
 	"Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine/pkg/normalizer"
@@ -94,13 +96,30 @@ func (h *GatewayHandler) ChatCompletions(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	ctx := r.Context()
+	// 1. Start Distributed Tracing Root Span & Metrics
+	startReq := time.Now()
+	metrics := observability.DefaultRegistry()
+	tracer := observability.DefaultTracer()
 
-	// 1. Semantic Cache Lookup (<50ms fast-path)
+	ctx, rootSpan := tracer.StartSpan(r.Context(), "HTTP POST /v1/chat/completions")
+	rootSpan.SetAttribute("http.method", "POST")
+	rootSpan.SetAttribute("http.path", "/v1/chat/completions")
+	rootSpan.SetAttribute("llm.model", req.Model)
+
+	statusStr := "200"
+	defer func() {
+		duration := time.Since(startReq).Seconds()
+		metrics.HTTPRequestsTotal.Inc(r.Method, "/v1/chat/completions", statusStr)
+		metrics.HTTPRequestDurationSeconds.Observe(duration, r.Method, "/v1/chat/completions")
+		rootSpan.End()
+	}()
+
+	// 2. Semantic Cache Lookup (<50ms fast-path)
 	var promptText string
 	var promptEmbedding []float32
 
 	if h.vectorStore != nil && h.embedder != nil {
+		_, cacheSpan := tracer.StartSpan(ctx, "SemanticCache.Lookup")
 		promptText = normalizer.ExtractPromptFromMessages(req.Messages)
 		if promptText != "" {
 			emb, err := h.embedder.Embed(ctx, promptText)
@@ -109,6 +128,15 @@ func (h *GatewayHandler) ChatCompletions(w http.ResponseWriter, r *http.Request)
 				cachedItem, findErr := h.vectorStore.FindSimilar(ctx, emb, h.cacheThreshold)
 				if findErr == nil && cachedItem != nil {
 					// Cache HIT: Replay response immediately with simulated latency
+					cacheSpan.SetAttribute("cache.hit", true)
+					cacheSpan.SetAttribute("cache.similarity", cachedItem.Similarity)
+					cacheSpan.End()
+
+					metrics.SemanticCacheHitsTotal.Inc()
+					metrics.LLMTimeToFirstTokenSeconds.Observe(0.015, "semantic_cache", req.Model, "true")
+					rootSpan.SetAttribute("cache.hit", true)
+					rootSpan.AddEvent("cache_hit", map[string]any{"similarity": cachedItem.Similarity})
+
 					w.Header().Set("X-Cache", "HIT")
 					if replayErr := h.replay.Replay(ctx, cachedItem, sseWriter); replayErr != nil {
 						log.Printf("[Gateway] Replay cache error: %v", replayErr)
@@ -117,9 +145,13 @@ func (h *GatewayHandler) ChatCompletions(w http.ResponseWriter, r *http.Request)
 				}
 			}
 		}
+		cacheSpan.SetAttribute("cache.hit", false)
+		cacheSpan.End()
 	}
 
 	// Cache MISS: Stream from upstream LLM models via Router
+	metrics.SemanticCacheMissesTotal.Inc()
+	rootSpan.SetAttribute("cache.hit", false)
 	w.Header().Set("X-Cache", "MISS")
 
 	// Set up token accumulator to persist completed response to vector cache asynchronously
@@ -139,7 +171,9 @@ func (h *GatewayHandler) ChatCompletions(w http.ResponseWriter, r *http.Request)
 	// Propagate request context. If client disconnects, r.Context().Done() cancels upstream.
 	err = h.router.StreamResponse(ctx, req, sseWriter)
 	if err != nil {
+		statusStr = "500"
 		if errors.Is(err, sse.ErrClientDisconnected) || errors.Is(ctx.Err(), http.ErrAbortHandler) {
+			statusStr = "499" // Client Closed Request
 			log.Printf("[Gateway] Client disconnected prematurely, canceled upstream streaming")
 			return
 		}
