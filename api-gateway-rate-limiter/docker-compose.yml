@@ -1,0 +1,70 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: gateway-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 5
+
+  backend-1:
+    build: .
+    container_name: mock-backend-1
+    entrypoint: ["/app/mock_backend"]
+    environment:
+      - PORT=8081
+      - INSTANCE_NAME=backend-1
+      - DELAY=50ms
+      - ERROR_RATE=0.0
+    ports:
+      - "8081:8081"
+
+  backend-2:
+    build: .
+    container_name: mock-backend-2
+    entrypoint: ["/app/mock_backend"]
+    environment:
+      - PORT=8082
+      - INSTANCE_NAME=backend-2
+      - DELAY=50ms
+      - ERROR_RATE=0.0
+    ports:
+      - "8082:8082"
+
+  backend-3:
+    build: .
+    container_name: mock-backend-3
+    entrypoint: ["/app/mock_backend"]
+    environment:
+      - PORT=8083
+      - INSTANCE_NAME=backend-3
+      - DELAY=50ms
+      - ERROR_RATE=0.1
+    ports:
+      - "8083:8083"
+
+  gateway:
+    build: .
+    container_name: api-gateway
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend-1:
+        condition: service_started
+      backend-2:
+        condition: service_started
+      backend-3:
+        condition: service_started
+    environment:
+      - PORT=8080
+      - UPSTREAMS=http://backend-1:8081,http://backend-2:8082,http://backend-3:8083
+      - LIMITER_MODE=redis
+      - REDIS_ADDR=redis:6379
+      - LB_ALGORITHM=least_connections
+    ports:
+      - "8080:8080"
