@@ -1,0 +1,19 @@
+# Binaries & build artifacts
+/bin/
+/dist/
+*.exe
+*.test
+
+# Environment files
+# .env (local compose contains default dev credentials)
+
+# OS and IDE files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Data directories (if mounted locally)
+data/
+logs/
