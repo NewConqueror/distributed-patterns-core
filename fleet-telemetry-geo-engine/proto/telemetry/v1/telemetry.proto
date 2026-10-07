@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package telemetry.v1;
+
+option go_package = "geopulse/gen/go/telemetry/v1;telemetryv1";
+
+// TelemetryService handles streaming location ingestion and geospatial queries.
+service TelemetryService {
+  // StreamLocation ingests a stream of location pings from driver clients.
+  rpc StreamLocation(stream LocationPing) returns (StreamAck);
+
+  // GetNearbyDrivers queries active drivers within a given radius.
+  rpc GetNearbyDrivers(RadiusQuery) returns (DriverList);
+}
+
+// LocationPing represents a single telemetry update from a vehicle/driver.
+message LocationPing {
+  string driver_id = 1;     // Unique identifier for the driver/vehicle
+  double latitude = 2;      // Latitude in WGS 84 format (-90.0 to +90.0)
+  double longitude = 3;     // Longitude in WGS 84 format (-180.0 to +180.0)
+  float bearing = 4;        // Heading direction in degrees (0.0 to 360.0)
+  float speed = 5;          // Current vehicle speed (e.g. km/h)
+  int64 timestamp = 6;      // Milliseconds since epoch (Unix timestamp)
+}
+
+// StreamAck is returned after a location streaming session finishes or acknowledges ingestion.
+message StreamAck {
+  bool success = 1;          // Whether the stream was successfully processed
+  string message = 2;        // Status or diagnostic message
+  int64 processed_count = 3; // Total pings received and processed in the stream
+  int64 server_time = 4;     // Server Unix timestamp (milliseconds) when ack was produced
+}
+
+// RadiusQuery defines parameters for spatial radius lookup.
+message RadiusQuery {
+  double latitude = 1;       // Center point latitude
+  double longitude = 2;      // Center point longitude
+  double radius_km = 3;      // Search radius in kilometers
+  int32 limit = 4;           // Maximum number of drivers to return (pagination/capping)
+}
+
+// DriverList contains the result of a spatial radius lookup.
+message DriverList {
+  repeated NearbyDriver drivers = 1; // List of drivers matching query criteria
+  int64 search_timestamp = 2;        // Server Unix timestamp (ms) when search completed
+}
+
+// NearbyDriver represents driver state with distance relative to the search center.
+message NearbyDriver {
+  string driver_id = 1;      // Unique identifier for the driver/vehicle
+  double latitude = 2;       // Current latitude
+  double longitude = 3;      // Current longitude
+  float bearing = 4;         // Heading direction in degrees
+  float speed = 5;           // Speed
+  double distance_km = 6;    // Distance from the query center in kilometers
+  int64 last_updated = 7;    // Milliseconds timestamp of driver's last known ping
+}
