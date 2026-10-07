@@ -1,0 +1,12 @@
+go 1.26.8
+
+use (
+	./ai-gateway-engine
+	./api-gateway-rate-limiter
+	./cdc-postgres-kafka-elasticsearch
+	./fault-tolerant-task-orchestrator
+	./flash-sale-engine
+	./fleet-telemetry-geo-engine
+	./immutable-financial-ledger
+	./multitenant-rebac-engine
+)
