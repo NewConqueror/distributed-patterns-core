@@ -1,0 +1,549 @@
+package handler
+
+import (
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"log"
+	"net/http"
+	"strconv"
+	"sync"
+	"time"
+
+	"flashsale/internal/metrics"
+	"flashsale/internal/model"
+	"github.com/google/uuid"
+)
+
+var saleStartTimes sync.Map
+
+// CreateOrderNaive handles order creation using the Naive (Flawed) approach.
+//
+// ANTIPATTERN (Check-Then-Act):
+// This endpoint purposely does NOT use row locks (e.g. SELECT FOR UPDATE),
+// optimistic concurrency checks, or distributed locks.
+//
+// Under concurrent load:
+// 1. Multiple requests read the same positive stock value.
+// 2. All pass the application-level `if stock > 0` check.
+// 3. All attempt to decrement stock sequentially.
+// 4. Results in overselling, or database check constraint errors (`CHECK (stock >= 0)`),
+//    and connection pool exhaustion if open connections are unlimited.
+func (h *Handler) CreateOrderNaive(w http.ResponseWriter, r *http.Request) {
+	var req model.OrderRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request payload")
+		return
+	}
+
+	if req.ProductID <= 0 || req.UserID == "" {
+		writeError(w, http.StatusBadRequest, "product_id and user_id are required")
+		return
+	}
+
+	tx, err := h.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		log.Printf("[DB ERROR - BeginTx]: %v\n", err)
+		writeError(w, http.StatusInternalServerError, "Failed to begin transaction: "+err.Error())
+		return
+	}
+	defer tx.Rollback()
+
+	// 1. SELECT stock FROM products WHERE id = :id
+	var stock int
+	err = tx.QueryRowContext(r.Context(), "SELECT stock FROM products WHERE id = $1", req.ProductID).Scan(&stock)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "Product not found")
+			return
+		}
+		log.Printf("[DB ERROR - Select Stock]: %v\n", err)
+		writeError(w, http.StatusInternalServerError, "Failed to query stock: "+err.Error())
+		return
+	}
+
+	// 2. Application-level check: if stock > 0
+	if stock <= 0 {
+		writeError(w, http.StatusBadRequest, "Out of stock")
+		return
+	}
+
+	// 3. UPDATE products SET stock = stock - 1 WHERE id = :id
+	_, err = tx.ExecContext(r.Context(), "UPDATE products SET stock = stock - 1 WHERE id = $1", req.ProductID)
+	if err != nil {
+		log.Printf("[DB ERROR - Update Stock]: %v\n", err)
+		writeError(w, http.StatusInternalServerError, "Failed to update stock: "+err.Error())
+		return
+	}
+
+	// 4. INSERT INTO orders ...
+	var orderID int
+	err = tx.QueryRowContext(
+		r.Context(),
+		"INSERT INTO orders (product_id, user_id) VALUES ($1, $2) RETURNING id",
+		req.ProductID,
+		req.UserID,
+	).Scan(&orderID)
+	if err != nil {
+		log.Printf("[DB ERROR - Insert Order]: %v\n", err)
+		writeError(w, http.StatusInternalServerError, "Failed to record order: "+err.Error())
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		log.Printf("[DB ERROR - Commit]: %v\n", err)
+		writeError(w, http.StatusInternalServerError, "Failed to commit transaction: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, model.OrderResponse{
+		OrderID:   orderID,
+		ProductID: req.ProductID,
+		UserID:    req.UserID,
+		Message:   "Order created successfully (Naive)",
+	})
+}
+
+// CreateOrderPessimistic handles order creation using Pessimistic Locking (SELECT ... FOR UPDATE).
+//
+// MECHANISM:
+// - Begins a database transaction.
+// - Executes `SELECT stock FROM products WHERE id = $1 FOR UPDATE`.
+//   This acquires an exclusive row-level lock on the product row.
+// - Other transactions trying to read the same row with FOR UPDATE or perform UPDATE/DELETE
+//   will block at the database level until this transaction finishes (COMMIT / ROLLBACK).
+// - Guarantees 100% data consistency (no overselling, no negative stock).
+//
+// TRADE-OFF:
+// - Serializes access at the database level, creating a queue.
+// - P95/P99 latency increases significantly.
+// - Holding connections while waiting for row locks can cause connection pool starvation.
+func (h *Handler) CreateOrderPessimistic(w http.ResponseWriter, r *http.Request) {
+	var req model.OrderRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request payload")
+		return
+	}
+
+	if req.ProductID <= 0 || req.UserID == "" {
+		writeError(w, http.StatusBadRequest, "product_id and user_id are required")
+		return
+	}
+
+	tx, err := h.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		log.Printf("[DB ERROR - BeginTx (Pessimistic)]: %v\n", err)
+		writeError(w, http.StatusInternalServerError, "Failed to begin transaction: "+err.Error())
+		return
+	}
+	defer tx.Rollback()
+
+	// 1. SELECT stock FROM products WHERE id = :id FOR UPDATE (Row-level lock)
+	var stock int
+	err = tx.QueryRowContext(r.Context(), "SELECT stock FROM products WHERE id = $1 FOR UPDATE", req.ProductID).Scan(&stock)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "Product not found")
+			return
+		}
+		log.Printf("[DB ERROR - Select FOR UPDATE]: %v\n", err)
+		writeError(w, http.StatusInternalServerError, "Failed to query stock with lock: "+err.Error())
+		return
+	}
+
+	// 2. Application-level check: if stock <= 0, rollback and return 400
+	if stock <= 0 {
+		writeError(w, http.StatusBadRequest, "Out of stock")
+		return
+	}
+
+	// 3. UPDATE products SET stock = stock - 1 WHERE id = :id
+	_, err = tx.ExecContext(r.Context(), "UPDATE products SET stock = stock - 1 WHERE id = $1", req.ProductID)
+	if err != nil {
+		log.Printf("[DB ERROR - Update Stock (Pessimistic)]: %v\n", err)
+		writeError(w, http.StatusInternalServerError, "Failed to update stock: "+err.Error())
+		return
+	}
+
+	// 4. INSERT INTO orders ...
+	var orderID int
+	err = tx.QueryRowContext(
+		r.Context(),
+		"INSERT INTO orders (product_id, user_id) VALUES ($1, $2) RETURNING id",
+		req.ProductID,
+		req.UserID,
+	).Scan(&orderID)
+	if err != nil {
+		log.Printf("[DB ERROR - Insert Order (Pessimistic)]: %v\n", err)
+		writeError(w, http.StatusInternalServerError, "Failed to record order: "+err.Error())
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		log.Printf("[DB ERROR - Commit (Pessimistic)]: %v\n", err)
+		writeError(w, http.StatusInternalServerError, "Failed to commit transaction: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, model.OrderResponse{
+		OrderID:   orderID,
+		ProductID: req.ProductID,
+		UserID:    req.UserID,
+		Message:   "Order created successfully (Pessimistic Lock)",
+	})
+}
+
+// CreateOrderOptimistic handles order creation using Optimistic Concurrency Control (OCC) with versioning.
+//
+// MECHANISM:
+// - Reads current stock and version without acquiring a database lock.
+// - Attempts atomic update: UPDATE products SET stock = stock - 1, version = version + 1 WHERE id = :id AND version = :current_version
+// - Checks RowsAffected():
+//   - If 1: update succeeded, inserts order, commits.
+//   - If 0: conflict detected (another transaction modified the version).
+// - Retries up to 3 times with exponential backoff.
+//
+// HIGH CONTENTION BEHAVIOR (The "Retry Storm"):
+// In flash sale scenarios where hundreds of concurrent requests target the EXACT same item:
+// - Only 1 request succeeds per version bump.
+// - All other concurrent requests fail their CAS update and enter the retry loop simultaneously.
+// - This triggers a "Retry Storm", multiplying DB queries, burning CPU, and exhausting connection pools,
+//   causing widespread 409 Conflict failures.
+func (h *Handler) CreateOrderOptimistic(w http.ResponseWriter, r *http.Request) {
+	var req model.OrderRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request payload")
+		return
+	}
+
+	if req.ProductID <= 0 || req.UserID == "" {
+		writeError(w, http.StatusBadRequest, "product_id and user_id are required")
+		return
+	}
+
+	const maxRetries = 3
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// 1. SELECT stock, version FROM products WHERE id = :id (Lock-free read)
+		var stock, currentVersion int
+		err := h.db.QueryRowContext(r.Context(),
+			"SELECT stock, version FROM products WHERE id = $1", req.ProductID).
+			Scan(&stock, &currentVersion)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeError(w, http.StatusNotFound, "Product not found")
+				return
+			}
+			log.Printf("[DB ERROR - Optimistic Select]: %v\n", err)
+			writeError(w, http.StatusInternalServerError, "Failed to read product: "+err.Error())
+			return
+		}
+
+		// 2. Stok kontrolü: Stok 0 veya altındaysa tekrar denemenin anlamı yok
+		if stock <= 0 {
+			writeError(w, http.StatusBadRequest, "Out of stock")
+			return
+		}
+
+		// 3. CAS Update (Compare-And-Swap) in transaction
+		tx, err := h.db.BeginTx(r.Context(), nil)
+		if err != nil {
+			log.Printf("[DB ERROR - Optimistic BeginTx]: %v\n", err)
+			writeError(w, http.StatusInternalServerError, "Failed to begin transaction: "+err.Error())
+			return
+		}
+
+		res, err := tx.ExecContext(r.Context(),
+			"UPDATE products SET stock = stock - 1, version = version + 1 WHERE id = $1 AND version = $2",
+			req.ProductID, currentVersion)
+		if err != nil {
+			_ = tx.Rollback()
+			log.Printf("[DB ERROR - Optimistic Update]: %v\n", err)
+			writeError(w, http.StatusInternalServerError, "Failed to update stock: "+err.Error())
+			return
+		}
+
+		rowsAffected, err := res.RowsAffected()
+		if err != nil {
+			_ = tx.Rollback()
+			writeError(w, http.StatusInternalServerError, "Failed to check affected rows: "+err.Error())
+			return
+		}
+
+		// 4. Eğer satır etkilenmediyse (rowsAffected == 0), başka biri araya girmiştir -> Çakışma (Conflict)
+		if rowsAffected == 0 {
+			_ = tx.Rollback()
+			log.Printf("[OCC CONFLICT] Product %d version mismatch (read version: %d, attempt %d/%d)\n",
+				req.ProductID, currentVersion, attempt+1, maxRetries)
+
+			if attempt < maxRetries-1 {
+				// Exponential backoff: 10ms, 20ms
+				backoff := time.Duration(10*(1<<attempt)) * time.Millisecond
+				time.Sleep(backoff)
+				continue
+			}
+
+			// Maksimum deneme aşıldı
+			writeError(w, http.StatusConflict, "Optimistic lock conflict: retry limit exceeded")
+			return
+		}
+
+		// 5. Başarılı ise sipariş kaydını oluştur
+		var orderID int
+		err = tx.QueryRowContext(
+			r.Context(),
+			"INSERT INTO orders (product_id, user_id) VALUES ($1, $2) RETURNING id",
+			req.ProductID,
+			req.UserID,
+		).Scan(&orderID)
+		if err != nil {
+			_ = tx.Rollback()
+			log.Printf("[DB ERROR - Optimistic Insert Order]: %v\n", err)
+			writeError(w, http.StatusInternalServerError, "Failed to record order: "+err.Error())
+			return
+		}
+
+		if err := tx.Commit(); err != nil {
+			log.Printf("[DB ERROR - Optimistic Commit]: %v\n", err)
+			writeError(w, http.StatusInternalServerError, "Failed to commit order: "+err.Error())
+			return
+		}
+
+		writeJSON(w, http.StatusCreated, model.OrderResponse{
+			OrderID:   orderID,
+			ProductID: req.ProductID,
+			UserID:    req.UserID,
+			Message:   "Order created successfully (Optimistic Lock)",
+		})
+		return
+	}
+}
+
+// CreateOrderFast handles lightning-fast order reservations entirely in Redis via atomic Lua scripting.
+//
+// MECHANISM (Zero Database Traffic at Ingestion):
+// 1. Executes preloaded Lua script (EVALSHA) on single-threaded Redis.
+// 2. Returns 1 -> Atomically decremented stock in Redis.
+//    Generates unique reservation_id (UUID) and responds HTTP 202 Accepted: {"status": "PENDING", "reservation_id": uuid}.
+// 3. Returns 0 -> Out of stock. Responds HTTP 410 Gone / 400 Bad Request immediately. Request NEVER hits PostgreSQL!
+// 4. Returns -1 -> Product not found in Redis. Responds HTTP 404 Not Found.
+//
+// GUARANTEES:
+// - Sub-10ms P99 latency.
+// - Zero DB connections consumed during traffic spike.
+// - Zero overselling guaranteed by Redis single-threaded execution model.
+// - Atomically establishes order:{reservation_id}:ttl key in Redis for automatic rollback if unpaid.
+func (h *Handler) CreateOrderFast(w http.ResponseWriter, r *http.Request) {
+	var req model.OrderRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request payload")
+		return
+	}
+
+	if req.ProductID <= 0 || req.UserID == "" {
+		writeError(w, http.StatusBadRequest, "product_id and user_id are required")
+		return
+	}
+
+	if h.redis == nil {
+		writeError(w, http.StatusInternalServerError, "Redis service unavailable")
+		return
+	}
+
+	// 1. Generate unique reservation_id (UUID)
+	reservationID := uuid.New().String()
+
+	// Optional custom TTL in seconds via query param ?ttl=10 (defaults to 600s / 10m)
+	ttlSeconds := 600
+	if ttlQuery := r.URL.Query().Get("ttl"); ttlQuery != "" {
+		if t, err := strconv.Atoi(ttlQuery); err == nil && t > 0 {
+			ttlSeconds = t
+		}
+	}
+
+	// 2. Execute preloaded atomic Lua script on Redis via EVALSHA
+	// Decrements stock, appends to Redis Stream, AND sets order TTL key in ONE atomic step (Zero Dual-Write Hazard!)
+	res, err := h.redis.DecrStockAndEnqueue(r.Context(), req.ProductID, reservationID, req.UserID, ttlSeconds)
+	if err != nil {
+		log.Printf("[REDIS ERROR]: %v\n", err)
+		writeError(w, http.StatusInternalServerError, "Redis error: "+err.Error())
+		return
+	}
+
+	switch res {
+	case 1:
+		// Track start of flash sale burst for stock depletion duration metric
+		saleStartTimes.LoadOrStore(req.ProductID, time.Now())
+
+		// Success: Stock decremented and event enqueued atomically
+		writeJSON(w, http.StatusAccepted, model.FastOrderResponse{
+			Status:        "PENDING",
+			ReservationID: reservationID,
+			TTLSeconds:    ttlSeconds,
+		})
+	case 0:
+		// Record stock depletion duration if this was the transition to 0 stock
+		if val, loaded := saleStartTimes.LoadAndDelete(req.ProductID); loaded {
+			if startTime, ok := val.(time.Time); ok {
+				elapsed := time.Since(startTime).Seconds()
+				metrics.StockDepletionDurationSeconds.WithLabelValues(strconv.Itoa(req.ProductID)).Set(elapsed)
+				log.Printf("[METRICS] Product %d stock completely depleted in %.4f seconds!\n", req.ProductID, elapsed)
+			}
+		}
+
+		// Out of stock: Fast fail! Database is 100% shielded from this traffic.
+		writeError(w, http.StatusGone, "Tükendi (Out of stock)")
+	case -1:
+		// Product not found
+		writeError(w, http.StatusNotFound, "Product not found")
+	default:
+		writeError(w, http.StatusInternalServerError, "Unexpected reservation response")
+	}
+}
+
+// PayOrder handles payment confirmation for a reserved order.
+//
+// EDGE CASE RESOLUTION (TTL & Rollback Defense):
+// If payment arrives within the TTL reservation window:
+// 1. Deletes order:{reservation_id}:ttl in Redis to permanently disarm the expiration rollback trigger.
+// 2. Atomically transitions order status from 'PENDING' to 'PAID' in PostgreSQL.
+// 3. Emits 'OrderPaid' event into outbox_events table.
+//
+// If the customer took longer than the TTL (e.g. 10 minutes):
+// - Key expiration has already fired, stock has been rolled back, and status is 'EXPIRED'.
+// - Rejects payment with HTTP 410 Gone ("Reservation expired").
+func (h *Handler) PayOrder(w http.ResponseWriter, r *http.Request) {
+	var req model.PayOrderRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request payload")
+		return
+	}
+
+	if req.ReservationID == "" {
+		writeError(w, http.StatusBadRequest, "reservation_id is required")
+		return
+	}
+
+	// 1. Query order by reservation_id
+	var orderID, productID int
+	var status, userID string
+	err := h.db.QueryRowContext(r.Context(),
+		"SELECT id, product_id, user_id, status FROM orders WHERE reservation_id = $1",
+		req.ReservationID,
+	).Scan(&orderID, &productID, &userID, &status)
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "Order reservation not found in database")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "Database error: "+err.Error())
+		return
+	}
+
+	if status == "EXPIRED" {
+		writeError(w, http.StatusGone, "Reservation has expired and stock was released back to inventory")
+		return
+	}
+
+	if status == "PAID" || status == "COMPLETED" {
+		writeJSON(w, http.StatusOK, model.PayOrderResponse{
+			ReservationID: req.ReservationID,
+			Status:        status,
+			Message:       "Order is already paid and confirmed (Idempotent response)",
+		})
+		return
+	}
+
+	// 2. Disarm Redis TTL expiration key
+	if h.redis != nil {
+		_ = h.redis.DeleteReservationTTL(r.Context(), req.ReservationID)
+	}
+
+	// 3. Mark order as PAID in PostgreSQL in transaction
+	tx, err := h.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to begin transaction: "+err.Error())
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(r.Context(),
+		"UPDATE orders SET status = 'PAID' WHERE id = $1 AND status = 'PENDING'",
+		orderID,
+	)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to update order status: "+err.Error())
+		return
+	}
+
+	payloadMap := map[string]any{
+		"order_id":       orderID,
+		"reservation_id": req.ReservationID,
+		"product_id":     productID,
+		"user_id":        userID,
+		"paid_at":        time.Now().UTC(),
+	}
+	payloadBytes, _ := json.Marshal(payloadMap)
+
+	_, err = tx.ExecContext(r.Context(),
+		"INSERT INTO outbox_events (id, aggregate_type, payload, status) VALUES ($1, $2, $3, $4)",
+		uuid.New().String(), "OrderPaid", string(payloadBytes), "PROCESSED",
+	)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to record outbox event: "+err.Error())
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to commit payment: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, model.PayOrderResponse{
+		ReservationID: req.ReservationID,
+		Status:        "PAID",
+		Message:       "Payment confirmed and order completed successfully",
+	})
+}
+
+// GetOrder retrieves an order by its numeric ID or reservation UUID.
+func (h *Handler) GetOrder(w http.ResponseWriter, r *http.Request) {
+	idOrUUID := r.PathValue("id")
+	if idOrUUID == "" {
+		writeError(w, http.StatusBadRequest, "order id or reservation_id is required")
+		return
+	}
+
+	var order model.Order
+	var resID sql.NullString
+
+	var err error
+	if _, parseErr := strconv.Atoi(idOrUUID); parseErr == nil {
+		err = h.db.QueryRowContext(r.Context(),
+			"SELECT id, reservation_id, product_id, user_id, status, created_at FROM orders WHERE id = $1",
+			idOrUUID,
+		).Scan(&order.ID, &resID, &order.ProductID, &order.UserID, &order.Status, &order.CreatedAt)
+	} else {
+		err = h.db.QueryRowContext(r.Context(),
+			"SELECT id, reservation_id, product_id, user_id, status, created_at FROM orders WHERE reservation_id = $1",
+			idOrUUID,
+		).Scan(&order.ID, &resID, &order.ProductID, &order.UserID, &order.Status, &order.CreatedAt)
+	}
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "Order not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "Database error: "+err.Error())
+		return
+	}
+
+	if resID.Valid {
+		order.ReservationID = resID.String
+	}
+
+	writeJSON(w, http.StatusOK, order)
+}
+
