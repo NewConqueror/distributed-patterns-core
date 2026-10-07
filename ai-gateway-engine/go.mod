@@ -1,0 +1,3 @@
+module Production_AIGateway_with_SemanticCaching_ModelFallbacks_SafeToolExecutionEngine
+
+go 1.22.2
