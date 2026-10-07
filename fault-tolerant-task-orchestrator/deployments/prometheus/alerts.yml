@@ -1,0 +1,26 @@
+groups:
+  - name: task_orchestrator_alerts
+    rules:
+      # 1. Queue Backlog Alert
+      # Triggers if the queue and PEL depth remains above 100 for 10 minutes continuously
+      - alert: QueueBacklogTooHigh
+        expr: task_orchestrator_queue_depth > 100
+        for: 10m
+        labels:
+          severity: critical
+          component: task-orchestrator
+        annotations:
+          summary: "Task queue depth backlog is critically high"
+          description: "Queue depth has been above 100 for more than 10 minutes (current value: {{ $value }}). Check worker health or scale up worker nodes."
+
+      # 2. Dead-Letter Queue Spike Alert
+      # Triggers if the percentage of jobs routed to DLQ exceeds 5% of total processed jobs in the last 5 minutes
+      - alert: DLQSpike
+        expr: (sum(rate(task_orchestrator_jobs_total{status="dlq"}[5m])) / sum(rate(task_orchestrator_jobs_total[5m]))) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          component: task-orchestrator
+        annotations:
+          summary: "Dead-Letter Queue failure spike detected"
+          description: "Over 5% of all tasks failed and were routed to DLQ in the last 5 minutes (rate: {{ $value | humanizePercentage }}). Investigate unhandled panics, malformed payloads, or downstream API outages."
